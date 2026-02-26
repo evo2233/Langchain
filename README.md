@@ -5,4 +5,6 @@ python 3.11\
 langchain (1.0.X)\
 langchain-community\
 langchain-deepseek (pip)\
+langchain_ollama\
+langchain_chroma\
 pypdf
