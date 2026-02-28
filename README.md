@@ -7,4 +7,6 @@ langchain-community\
 langchain-deepseek (pip)\
 langchain_ollama\
 langchain_chroma\
+psycopg\
+langgraph-checkpoint-postgres\
 pypdf
