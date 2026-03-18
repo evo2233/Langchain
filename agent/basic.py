@@ -56,6 +56,7 @@ for message in messages:
 print("=== 2 ===")
 results = agent.stream(
     {"messages": [{"role": "user", "content": "What is the weather in Tokyo"}]},
+    context=Context(user_gender="Female"),
     stream_mode="values"
 )
 
@@ -67,6 +68,7 @@ for result in results:
 print("=== 3 ===")
 results = agent.stream(
     {"messages": [{"role": "user", "content": "What is the weather in Tokyo"}]},
+    context=Context(user_gender="Helicopter"),
     stream_mode="updates"
 )
 
