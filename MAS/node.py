@@ -23,7 +23,7 @@ class AgentEvalBuffer:
 
     def update(self, eval_result):
         self.total_sample_nums += 1
-        self.scores.append(eval_result.scores)
+        self.scores.append(eval_result.score)
 
         if eval_result.correctness == "correct":
             self.correct_sample_nums += 1
@@ -77,6 +77,8 @@ class AgentEvalManager:
 
     def refresh_need_opt(self):
         stats = {}
+        for agent_id in self.agent_evals:
+            self.need_opt[agent_id] = False
 
         for agent_id, buffer in self.agent_evals.items():
             if not buffer.scores:
@@ -85,7 +87,8 @@ class AgentEvalManager:
             # Calculate metrics
             mean_score = sum(buffer.scores) / buffer.total_sample_nums
             low_score_ratio = sum(1 for s in buffer.scores if s <= 2) / buffer.total_sample_nums
-            risk = self.alpha * (5 - mean_score) + self.beta * low_score_ratio
+            normalized_mean_risk = (5 - mean_score) / 4.0  # 0~1
+            risk = self.alpha * normalized_mean_risk + self.beta * low_score_ratio
             if buffer.category_stats:
                 most_common_count = max(
                     info["count"] for info in buffer.category_stats.values()
@@ -111,7 +114,7 @@ class AgentEvalManager:
                 a
             )
         )
-        for _, agent_id in sorted_agents[:self.optimize_top_k]:
+        for agent_id in sorted_agents[:self.optimize_top_k]:
             self.need_opt[agent_id] = True
 
     def get_buffer(self, agent_id: str):
@@ -124,7 +127,7 @@ class AgentEvalManager:
 class AggEvalManager:
     """管理 agg_credits"""
     def __init__(self, num_rounds=3):
-        # todo: not init as 100
+        # todo: not init as 5.0
         self.agg_credits = [5.0] * num_rounds
         self.agg_error_buffers = [[] for _ in range(num_rounds)]
         self.need_opt = [False for _ in range(num_rounds)]
@@ -157,7 +160,7 @@ class AggEvalManager:
         # if all_wrong:
         #     return False
 
-        if len(self.agg_error_buffers[agg_idx]) < 10:
+        if len(self.agg_error_buffers[agg_idx]) < 20:
             self.agg_error_buffers[agg_idx].append(eval_result)
 
         # 触发判断
@@ -168,8 +171,8 @@ class AggEvalManager:
         xml_output = "<failure_analysis>\n"
 
         for result in self.agg_error_buffers[agg_idx]:
-            xml_output += f'    <category>{result.get("failure_category", "")}</category>\n'
-            xml_output += f'    <description>{result.get("explanation", "")}</description>\n'
+            xml_output += f'    <category>{getattr(result, "failure_category", "")}</category>\n'
+            xml_output += f'    <description>{getattr(result, "explanation", "")}</description>\n'
 
         xml_output += "</failure_analysis>"
         if self.debugflag:
