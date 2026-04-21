@@ -12,7 +12,8 @@ class AgentEvalBuffer:
     """Store train data and compressed failure statistics for one node."""
     def __init__(self, max_examples_per_category=5):
         self.total_sample_nums = 0
-        self.score = []
+        self.correct_sample_nums = 0
+        self.scores = []
         self.max_examples = max_examples_per_category
         self.category_stats = defaultdict(lambda: {
             "count": 0,
@@ -22,9 +23,10 @@ class AgentEvalBuffer:
 
     def update(self, eval_result):
         self.total_sample_nums += 1
-        self.score.append(eval_result.score)
+        self.scores.append(eval_result.scores)
 
         if eval_result.correctness == "correct":
+            self.correct_sample_nums += 1
             return
         category = eval_result.failure_category
         if category == "NONE":
@@ -61,7 +63,62 @@ class AgentEvalBuffer:
 
 class AgentEvalManager:
     def __init__(self):
+        self.agent_evals: Dict[str, AgentEvalBuffer] = {}
+        self.need_opt: Dict[str, bool] = {}
+        self.optimize_top_k = 2
+        self.alpha = 0.6  # Mean score weight
+        self.beta = 0.4  # Low score ratio weight
 
+    def update(self, agent_id: str, eval_result):
+        if agent_id not in self.agent_evals:
+            self.agent_evals[agent_id] = AgentEvalBuffer()
+
+        self.agent_evals[agent_id].update(eval_result)
+
+    def refresh_need_opt(self):
+        stats = {}
+
+        for agent_id, buffer in self.agent_evals.items():
+            if not buffer.scores:
+                continue
+
+            # Calculate metrics
+            mean_score = sum(buffer.scores) / buffer.total_sample_nums
+            low_score_ratio = sum(1 for s in buffer.scores if s <= 2) / buffer.total_sample_nums
+            risk = self.alpha * (5 - mean_score) + self.beta * low_score_ratio
+            if buffer.category_stats:
+                most_common_count = max(
+                    info["count"] for info in buffer.category_stats.values()
+                )
+                pattern_concentration = most_common_count / buffer.total_sample_nums
+            else:
+                pattern_concentration = 0.0
+            # Store all calculated metrics
+            stats[agent_id] = {
+                "risk": risk,
+                "mean_score": mean_score,
+                "low_score_ratio": low_score_ratio,
+                "pattern_concentration": pattern_concentration
+            }
+
+        sorted_agents = sorted(
+            stats.keys(),
+            key=lambda a: (
+                -stats[a]["risk"],
+                -stats[a]["low_score_ratio"],
+                stats[a]["mean_score"],
+                -stats[a]["pattern_concentration"],
+                a
+            )
+        )
+        for _, agent_id in sorted_agents[:self.optimize_top_k]:
+            self.need_opt[agent_id] = True
+
+    def get_buffer(self, agent_id: str):
+        if agent_id not in self.agent_evals:
+            self.agent_evals[agent_id] = AgentEvalBuffer()
+            self.need_opt.setdefault(agent_id, False)
+        return self.agent_evals[agent_id]
 
 
 class AggEvalManager:
@@ -79,7 +136,7 @@ class AggEvalManager:
     def update_and_check(self, agg_idx: int, eval_result):
         # 计算信用分
         old_credit = self.agg_credits[agg_idx]
-        new_credit = (1.0 - self.learn_rate) * old_credit + self.learn_rate * float(eval_result.score)
+        new_credit = (1.0 - self.learn_rate) * old_credit + self.learn_rate * float(eval_result.scores)
 
         self.agg_credits[agg_idx] = new_credit
 
@@ -129,7 +186,7 @@ class DebateState(TypedDict):
     final_answer: str
 
     # 存储各个 Agent 的多轮评估结果、错误解释等
-    agent_evaluations: Dict[str, AgentEvalBuffer]
+    agent_evaluations: AgentEvalManager
     agent_error_summaries: Dict[str, str]
     agent_prompts: Dict[str, str]  # 存储当前 agent 的 old_prompt
 
@@ -230,11 +287,8 @@ def create_agent_eval_node(agent_id: str, llm, base_system_prompt: str):
         ])
 
         # 将评估结果追加到状态中
-        evals = state.get("agent_evaluations", {}).copy()
-        if agent_id not in evals:
-            evals[agent_id] = AgentEvalBuffer()
-
-        evals[agent_id].update(res)
+        evals = state.get("agent_evaluations", AgentEvalManager())
+        evals.update(agent_id, res)
 
         return {"agent_evaluations": evals}
 
@@ -253,7 +307,8 @@ def create_agent_error_diagnosis_node(agent_id: str, llm, base_system_prompt: st
     system_prompt = base_system_prompt + instruction_appendix
 
     def node(state: DebateState):
-        formatted_input = state.get("agent_evaluations", {}).get(agent_id, AgentEvalBuffer()).summary_for_llm()
+        evals = state.get("agent_evaluations", AgentEvalManager())
+        formatted_input = evals.get_buffer(agent_id).summary_for_llm()
 
         chain = llm.with_structured_output(AgentErrorDiagnosisOutput)
         res = chain.invoke([

@@ -8,7 +8,7 @@ from langgraph.graph import StateGraph
 from node import (
     DebateState, create_debate_node, create_aggregator_node,
     create_agent_eval_node, create_agent_error_diagnosis_node, create_role_prompt_opt_node,
-    create_agg_eval_node, create_agg_error_diagnosis_node, create_agg_prompt_opt_node, AgentEvalBuffer, AggEvalManager
+    create_agg_eval_node, create_agg_error_diagnosis_node, create_agg_prompt_opt_node, AgentEvalManager, AggEvalManager
 )
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s - %(message)s')
@@ -139,7 +139,7 @@ def train_workflow(trainset, max_epochs=3):
         forward_app = build_forward_eval_graph(global_prompts, agg_prompts)
 
         # 初始化当前 Epoch 的评估缓存
-        epoch_agent_evals = {"agent_1": AgentEvalBuffer(), "agent_2": AgentEvalBuffer(), "agent_3": AgentEvalBuffer()}
+        epoch_agent_evals = AgentEvalManager()
         epoch_agg_evals = AggEvalManager()
 
         for i, ex in enumerate(trainset):
@@ -185,11 +185,9 @@ def train_workflow(trainset, max_epochs=3):
         # --- C. Spatial Optimization (Agent 周期更新) ---
         logging.info("\nEnd of Epoch. Triggering Spatial Optimization for Agents...")
 
-        # todo: 对齐 select_worst_agents
+        epoch_agent_evals.refresh_need_opt()
         for agent_id in ["agent_1", "agent_2", "agent_3"]:
-            evals = epoch_agent_evals.get(agent_id, AgentEvalBuffer())
-
-            if :
+            if epoch_agent_evals.need_opt.get(agent_id, False):
                 logging.info(f"Agent [{agent_id}]. Optimizing...")
                 agent_opt_app = build_agent_opt_graph(agent_id)
 
