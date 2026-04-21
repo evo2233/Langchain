@@ -1,5 +1,6 @@
 import os
 import logging
+from pathlib import Path
 
 from langchain_openai import ChatOpenAI
 from langgraph.constants import END
@@ -12,7 +13,25 @@ from node import (
     load_json_for_langgraph
 )
 
-logging.basicConfig(level=logging.INFO, format='%(levelname)s - %(message)s')
+def configure_logging() -> Path:
+    log_path = Path(__file__).resolve().parent / "training_log.txt"
+    formatter = logging.Formatter(
+        "%(asctime)s - %(levelname)s - %(name)s - %(message)s"
+    )
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    root_logger.handlers.clear()
+
+    file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(stream_handler)
+    root_logger.info("Logging initialized. Log file: %s", log_path)
+    return log_path
 
 VLLM_API_BASE = os.getenv("VLLM_API_BASE", f"http://127.0.0.1:8085/v1")
 VLLM_API_KEY = os.getenv("VLLM_API_KEY", "vllm")
@@ -110,7 +129,7 @@ def build_agg_opt_graph(agg_idx: int):
     """构建 Aggregator 时间优化图 (诊断 -> 优化)"""
     workflow = StateGraph(DebateState)
     workflow.add_node("diag", create_agg_error_diagnosis_node(agg_idx, llm, EVAL_BASE_PROMPT))
-    workflow.add_node("opt", create_agg_prompt_opt_node(llm, OPT_BASE_PROMPT))
+    workflow.add_node("opt", create_agg_prompt_opt_node(agg_idx, llm, OPT_BASE_PROMPT))
 
     workflow.set_entry_point("diag")
     workflow.add_edge("diag", "opt")
@@ -210,6 +229,7 @@ def train_workflow(trainset, max_epochs=3):
 
 
 if __name__ == '__main__':
+    configure_logging()
     # 简单的 Mock 数据格式，你需要将其替换为你真实的 trainset 格式
     dummy_trainset = load_json_for_langgraph(path="../data/MedMCQ/MedMCQAtrain.json")
 

@@ -376,7 +376,7 @@ def create_role_prompt_opt_node(agent_id: str, llm, base_system_prompt: str):
 
         if failure_summary is None:
             logging.warning("Can't optimize role prompt. No failure_summary provided.")
-            return {"agent_prompts": old_prompt}
+            return {"agent_prompts": state.get("agent_prompts", {}).copy()}
 
         formatted_input = (
             f"<old_prompt>\n{old_prompt}\n</old_prompt>\n"
@@ -498,7 +498,7 @@ def create_agg_error_diagnosis_node(agg_idx: int, llm, base_system_prompt: str):
     return node
 
 
-def create_agg_prompt_opt_node(llm, base_system_prompt: str):
+def create_agg_prompt_opt_node(agg_idx: int, llm, base_system_prompt: str):
     """优化 Aggregator 的系统提示词"""
     instruction_appendix = """
 
@@ -512,12 +512,21 @@ def create_agg_prompt_opt_node(llm, base_system_prompt: str):
     system_prompt = base_system_prompt + instruction_appendix
 
     def node(state: DebateState):
-        old_prompt = state.get("agg_prompts", "No old prompt provided.")
+        agg_prompts = state.get("agg_prompts", [])
+        if not isinstance(agg_prompts, list) or not agg_prompts:
+            logging.warning("Can't optimize agg prompt. No agg_prompts provided.")
+            return {"agg_prompts": agg_prompts}
+
+        if agg_idx >= len(agg_prompts):
+            logging.warning("Can't optimize agg prompt. Invalid agg_idx=%s.", agg_idx)
+            return {"agg_prompts": agg_prompts}
+
+        old_prompt = agg_prompts[agg_idx]
         critic_diagnosis = state.get("agg_error_diagnosis", None)
 
         if critic_diagnosis is None:
             logging.warning("Can't optimize agg prompt. No critic_diagnosis provided.")
-            return {"agg_prompt": old_prompt}
+            return {"agg_prompts": agg_prompts}
 
         formatted_input = (
             f"<old_prompt>\n{old_prompt}\n</old_prompt>\n"
@@ -530,6 +539,8 @@ def create_agg_prompt_opt_node(llm, base_system_prompt: str):
             ("human", f"Rewrite the Aggregator system prompt to fix the diagnosed behaviors.\n\n{formatted_input}")
         ])
 
-        return {"agg_prompt": res.new_prompt}
+        new_prompts = list(agg_prompts)
+        new_prompts[agg_idx] = res.new_prompt
+        return {"agg_prompts": new_prompts}
 
     return node
