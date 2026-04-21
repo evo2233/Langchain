@@ -6,6 +6,7 @@ from output import (
     AgentErrorDiagnosisOutput, RolePromptOptOutput,
     AggEvalOutput, AggErrorDiagnosisOutput, AggPromptOptOutput
 )
+from nlp_utils import extract_option
 
 
 class AgentEvalBuffer:
@@ -136,10 +137,16 @@ class AggEvalManager:
         self.min_errors_before_opt = 15
         self.debugflag = True
 
-    def update_and_check(self, agg_idx: int, eval_result):
+    def update_and_check(self, agg_idx: int, eval_result, correct_option: str = "", agent_options: List[str] = None):
+        # 如果所有 Agent 全错，不进行处罚/优化
+        valid_agent_options = [opt for opt in (agent_options or []) if opt]
+        if correct_option and valid_agent_options and all(opt != correct_option for opt in valid_agent_options):
+            return
+
         # 计算信用分
         old_credit = self.agg_credits[agg_idx]
-        new_credit = (1.0 - self.learn_rate) * old_credit + self.learn_rate * float(eval_result.scores)
+        score_value = getattr(eval_result, "score", getattr(eval_result, "scores", 0))
+        new_credit = (1.0 - self.learn_rate) * old_credit + self.learn_rate * float(score_value)
 
         self.agg_credits[agg_idx] = new_credit
 
@@ -149,16 +156,6 @@ class AggEvalManager:
         category = eval_result.failure_category
         if category == "NONE":
             return
-
-        # 提取选项
-        # correct_answer = state["correct_answer"]
-        # correct_opt = extract_option(correct_answer)
-        # agent_opts = [extract_option(v.get('answer', '')) for v in state["responses"].values()]
-
-        # todo: 如果所有 Agent 全错，不进行处罚/优化
-        # all_wrong = all(opt != correct_opt for opt in agent_opts)
-        # if all_wrong:
-        #     return False
 
         if len(self.agg_error_buffers[agg_idx]) < 20:
             self.agg_error_buffers[agg_idx].append(eval_result)
@@ -276,10 +273,12 @@ def create_agent_eval_node(agent_id: str, llm, base_system_prompt: str):
     def node(state: DebateState):
         agent_answer_dict = state["responses"].get(agent_id, {})
         agent_answer_text = f"Answer: {agent_answer_dict.get('answer', '')}\nReason: {agent_answer_dict.get('reason', '')}"
+        correct_option = extract_option(state["correct_answer"], llm=llm)
 
         formatted_input = (
             f"<question>\n{state['question']}\n</question>\n"
             f"<correct_answer>\n{state['correct_answer']}\n</correct_answer>\n"
+            f"<correct_option>\n{correct_option}\n</correct_option>\n"
             f"<agent_answer>\n{agent_answer_text}\n</agent_answer>"
         )
 
@@ -397,12 +396,24 @@ def create_agg_eval_node(agg_idx: int, llm, base_system_prompt: str):
             f"Agent [{k}]:\nAnswer: {v.get('answer', '')}\nReason: {v.get('reason', '')}"
             for k, v in state["responses"].items()
         ])
+        correct_option = extract_option(state["correct_answer"], llm=llm)
+        final_option = extract_option(state["final_answer"], llm=llm)
+        agent_options = []
+        for v in state["responses"].values():
+            answer = v.get("answer", "")
+            try:
+                agent_options.append(extract_option(answer, llm=llm))
+            except Exception:
+                logging.warning("Failed to extract agent option from answer: %s", answer[:100])
+                agent_options.append("")
 
         formatted_input = (
             f"<question>\n{state['question']}\n</question>\n"
             f"<correct_answer>\n{state['correct_answer']}\n</correct_answer>\n"
+            f"<correct_option>\n{correct_option}\n</correct_option>\n"
             f"<agent_debates>\n{agent_answers_text}\n</agent_debates>\n"
-            f"<aggregate_answer>\n{state['final_answer']}\n</aggregate_answer>"
+            f"<aggregate_answer>\n{state['final_answer']}\n</aggregate_answer>\n"
+            f"<aggregate_option>\n{final_option}\n</aggregate_option>"
         )
 
         chain = llm.with_structured_output(AggEvalOutput)
@@ -413,7 +424,12 @@ def create_agg_eval_node(agg_idx: int, llm, base_system_prompt: str):
 
         # 记录汇总评估结果
         evals = state.get("agg_evaluations")
-        evals.update_and_check(agg_idx, res)
+        evals.update_and_check(
+            agg_idx,
+            res,
+            correct_option=correct_option,
+            agent_options=agent_options
+        )
 
         return {"agg_evaluations": evals}
 

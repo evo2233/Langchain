@@ -1,10 +1,13 @@
 import os
 import logging
+import json
+from typing import List, Dict, Optional
 
 from langchain_openai import ChatOpenAI
 from langgraph.constants import END
 from langgraph.graph import StateGraph
 
+from nlp_utils import extract_option
 from node import (
     DebateState, create_debate_node, create_aggregator_node,
     create_agent_eval_node, create_agent_error_diagnosis_node, create_role_prompt_opt_node,
@@ -120,6 +123,52 @@ def build_agg_opt_graph(agg_idx: int):
 # ==========================================
 # 2. 训练主循环
 # ==========================================
+
+
+def load_mcq_json_for_langgraph(
+    path: str,
+    q_key: str = "query",
+    a_key: str = "gt",
+    num: Optional[int] = None
+) -> List[Dict[str, str]]:
+    """
+    加载原有 MCQ JSON 数据，并转换成当前 LangGraph 训练流程可直接消费的数据格式。
+
+    输入（兼容旧数据）:
+    [
+      {"query": "...", "gt": "C"},
+      ...
+    ]
+
+    输出（当前 train_workflow 期望）:
+    [
+      {"question": "...", "correct_answer": "C"},
+      ...
+    ]
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    dataset: List[Dict[str, str]] = []
+    for idx, item in enumerate(data):
+        if q_key not in item or a_key not in item:
+            raise KeyError(
+                f"Sample index {idx} missing required key(s): "
+                f"q_key='{q_key}' or a_key='{a_key}'."
+            )
+
+        raw_answer = str(item[a_key])
+        dataset.append(
+            {
+                "question": str(item[q_key]),
+                "correct_answer": extract_option(raw_answer, llm=llm),
+            }
+        )
+
+        if num is not None and len(dataset) >= int(num):
+            break
+
+    return dataset
 
 def train_workflow(trainset, max_epochs=3):
     # 1. 初始提示词配置
