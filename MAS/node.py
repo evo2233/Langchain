@@ -1,11 +1,48 @@
+import json
 import logging
 from collections import defaultdict
-from typing import TypedDict, Dict, List
+from typing import TypedDict, Dict, List, Optional
+
+from nlp_utils import extract_option
 from output import (
     AgentOutput, AggregatorOutput, AgentEvalOutput,
     AgentErrorDiagnosisOutput, RolePromptOptOutput,
     AggEvalOutput, AggErrorDiagnosisOutput, AggPromptOptOutput
 )
+
+
+def load_json_for_langgraph(
+    path: str,
+    q_key: str = "query",
+    a_key: str = "gt",
+    num: Optional[int] = None
+) -> List[Dict[str, str]]:
+    """
+    加载原有 MCQ JSON 数据，并转换成当前 LangGraph 训练流程可直接消费的数据格式。
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    dataset: List[Dict[str, str]] = []
+    for idx, item in enumerate(data):
+        if q_key not in item or a_key not in item:
+            raise KeyError(
+                f"Sample index {idx} missing required key(s): "
+                f"q_key='{q_key}' or a_key='{a_key}'."
+            )
+
+        correct_opt = extract_option(str(item[a_key]))
+        dataset.append(
+            {
+                "question": str(item[q_key]),
+                "correct_answer": correct_opt,
+            }
+        )
+
+        if num is not None and len(dataset) >= int(num):
+            break
+
+    return dataset
 
 
 class AgentEvalBuffer:
@@ -127,8 +164,7 @@ class AgentEvalManager:
 class AggEvalManager:
     """管理 agg_credits"""
     def __init__(self, num_rounds=3):
-        # todo: not init as 5.0
-        self.agg_credits = [5.0] * num_rounds
+        self.agg_credits = [3.0] * num_rounds
         self.agg_error_buffers = [[] for _ in range(num_rounds)]
         self.need_opt = [False for _ in range(num_rounds)]
         self.learn_rate = 0.2
@@ -136,10 +172,15 @@ class AggEvalManager:
         self.min_errors_before_opt = 15
         self.debugflag = True
 
-    def update_and_check(self, agg_idx: int, eval_result):
+    def update_and_check(self, agg_idx: int, eval_result, correct_option: str = "", agent_options: List[str] = None):
+        # 如果所有 Agent 全错，不进行处罚/优化
+        valid_agent_options = [opt for opt in (agent_options or []) if opt]
+        if correct_option and valid_agent_options and all(opt != correct_option for opt in valid_agent_options):
+            return
+
         # 计算信用分
         old_credit = self.agg_credits[agg_idx]
-        new_credit = (1.0 - self.learn_rate) * old_credit + self.learn_rate * float(eval_result.scores)
+        new_credit = (1.0 - self.learn_rate) * old_credit + self.learn_rate * float(eval_result.score)
 
         self.agg_credits[agg_idx] = new_credit
 
@@ -149,16 +190,6 @@ class AggEvalManager:
         category = eval_result.failure_category
         if category == "NONE":
             return
-
-        # 提取选项
-        # correct_answer = state["correct_answer"]
-        # correct_opt = extract_option(correct_answer)
-        # agent_opts = [extract_option(v.get('answer', '')) for v in state["responses"].values()]
-
-        # todo: 如果所有 Agent 全错，不进行处罚/优化
-        # all_wrong = all(opt != correct_opt for opt in agent_opts)
-        # if all_wrong:
-        #     return False
 
         if len(self.agg_error_buffers[agg_idx]) < 20:
             self.agg_error_buffers[agg_idx].append(eval_result)
@@ -398,6 +429,15 @@ def create_agg_eval_node(agg_idx: int, llm, base_system_prompt: str):
             for k, v in state["responses"].items()
         ])
 
+        agent_options = []
+        for v in state["responses"].values():
+            answer = v.get("answer", "")
+            try:
+                agent_options.append(extract_option(answer, llm=llm))
+            except Exception:
+                logging.warning("Failed to extract agent option from answer: %s", answer[:100])
+                agent_options.append("")
+
         formatted_input = (
             f"<question>\n{state['question']}\n</question>\n"
             f"<correct_answer>\n{state['correct_answer']}\n</correct_answer>\n"
@@ -413,7 +453,11 @@ def create_agg_eval_node(agg_idx: int, llm, base_system_prompt: str):
 
         # 记录汇总评估结果
         evals = state.get("agg_evaluations")
-        evals.update_and_check(agg_idx, res)
+        evals.update_and_check(
+            agg_idx, res,
+            correct_option=state["correct_answer"],
+            agent_options=agent_options
+        )
 
         return {"agg_evaluations": evals}
 

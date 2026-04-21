@@ -8,7 +8,8 @@ from langgraph.graph import StateGraph
 from node import (
     DebateState, create_debate_node, create_aggregator_node,
     create_agent_eval_node, create_agent_error_diagnosis_node, create_role_prompt_opt_node,
-    create_agg_eval_node, create_agg_error_diagnosis_node, create_agg_prompt_opt_node, AgentEvalManager, AggEvalManager
+    create_agg_eval_node, create_agg_error_diagnosis_node, create_agg_prompt_opt_node, AgentEvalManager, AggEvalManager,
+    load_json_for_langgraph
 )
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s - %(message)s')
@@ -210,21 +211,13 @@ def train_workflow(trainset, max_epochs=3):
 
 if __name__ == '__main__':
     # 简单的 Mock 数据格式，你需要将其替换为你真实的 trainset 格式
-    dummy_trainset = [
-        {
-            "question": "Which of the following defines the pressure in the vascular system in the absence of blood flow?\n(A) Pulse pressure\n(B) Critical closing pressure\n(C) Mean circulatory filling pressure\n(D) Perfusion pressure",
-            "correct_answer": "C"
-        },
-        {
-            "question": "What is the primary mechanism of action for penicillin?\n(A) Protein synthesis inhibition\n(B) Cell wall synthesis inhibition\n(C) DNA gyrase inhibition\n(D) RNA polymerase inhibition",
-            "correct_answer": "B"
-        }
-    ]
+    dummy_trainset = load_json_for_langgraph(path="../data/MedMCQ/MedMCQAtrain.json")
 
     # 启动训练
-    final_agent_prompts, final_agg_prompt = train_workflow(dummy_trainset, max_epochs=3)
+    final_agent_prompts, final_agg_prompts = train_workflow(dummy_trainset, max_epochs=3)
 
     print("\n\n=== Final Optimized Prompts ===")
-    print(f"Aggregator:\n{final_agg_prompt}\n")
+    for i, p in enumerate(final_agg_prompts):
+        print(f"Aggregator {i+1}:\n{p}")
     for k, v in final_agent_prompts.items():
         print(f"{k}:\n{v}\n")
