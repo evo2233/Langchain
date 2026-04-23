@@ -11,6 +11,89 @@ from output import (
 )
 
 
+def _json_default(obj):
+    if hasattr(obj, "model_dump"):
+        return obj.model_dump()
+    if hasattr(obj, "dict"):
+        return obj.dict()
+    return str(obj)
+
+
+def _safe_json_dumps(payload) -> str:
+    return json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default)
+
+
+def _log_invoke_exception(tag: str, exc: Exception) -> None:
+    detail_payload = {
+        "error_type": type(exc).__name__,
+        "error_message": str(exc),
+    }
+    completion = getattr(exc, "completion", None)
+    if completion is not None:
+        choices = []
+        for c in getattr(completion, "choices", []) or []:
+            msg = getattr(c, "message", None)
+            choices.append({
+                "finish_reason": getattr(c, "finish_reason", None),
+                "content": getattr(msg, "content", None),
+                "refusal": getattr(msg, "refusal", None),
+            })
+        detail_payload["completion"] = {
+            "id": getattr(completion, "id", None),
+            "model": getattr(completion, "model", None),
+            "usage": getattr(completion, "usage", None),
+            "choices": choices,
+        }
+    logging.error("[%s] LLM invoke exception details: %s", tag, _safe_json_dumps(detail_payload))
+
+
+def _log_llm_messages(tag: str, messages: List[tuple]) -> None:
+    logging.info("[%s] LLM input messages: %s", tag, _safe_json_dumps(messages))
+
+
+def _log_llm_output(tag: str, output_obj) -> None:
+    if hasattr(output_obj, "model_dump"):
+        output_payload = output_obj.model_dump()
+    elif hasattr(output_obj, "dict"):
+        output_payload = output_obj.dict()
+    else:
+        output_payload = output_obj
+    logging.info("[%s] LLM output: %s", tag, _safe_json_dumps(output_payload))
+
+
+def _extract_structured_response(result, tag: str):
+    if isinstance(result, dict) and "parsed" in result:
+        raw_obj = result.get("raw")
+        raw_payload = {
+            "content": getattr(raw_obj, "content", raw_obj),
+            "response_metadata": getattr(raw_obj, "response_metadata", {}),
+            "additional_kwargs": getattr(raw_obj, "additional_kwargs", {}),
+        }
+        logging.info("[%s] LLM raw output: %s", tag, _safe_json_dumps(raw_payload))
+
+        parsing_error = result.get("parsing_error")
+        if parsing_error:
+            logging.error("[%s] Structured parsing failed: %s", tag, str(parsing_error))
+        parsed = result.get("parsed")
+        if parsed is None:
+            raise RuntimeError(f"[{tag}] Structured output parsing failed. See raw output logs for details.")
+        return parsed
+    return result
+
+
+def _invoke_with_logging(chain, messages: List[tuple], tag: str):
+    _log_llm_messages(tag, messages)
+    try:
+        res = chain.invoke(messages)
+        parsed_res = _extract_structured_response(res, tag)
+        _log_llm_output(tag, parsed_res)
+        return parsed_res
+    except Exception as exc:
+        _log_invoke_exception(tag, exc)
+        logging.exception("[%s] LLM invoke failed.", tag)
+        raise
+
+
 def load_json_for_langgraph(
     path: str,
     q_key: str = "query",
@@ -245,12 +328,13 @@ def create_debate_node(agent_id: str, llm, system_prompt):
         formatted_input = f"<question>\n{state['question']}\n</question>\n"
         formatted_input += f"<other_agent_responses>\n{others_text}\n</other_agent_responses>"
 
-        chain = llm.with_structured_output(AgentOutput)
+        chain = llm.with_structured_output(AgentOutput, include_raw=True)
 
-        res = chain.invoke([
+        messages = [
             ("system", system_prompt),
             ("human", f"Please provide your medical reasoning and answer.\n\n{formatted_input}")
-        ])
+        ]
+        res = _invoke_with_logging(chain, messages, f"{agent_id}_debate")
 
         # 更新状态中对应的 Agent 回答
         new_responses = dict(state["responses"])
@@ -273,11 +357,12 @@ def create_aggregator_node(llm, system_prompt):
         formatted_input = f"<question>\n{state['question']}\n</question>\n"
         formatted_input += f"<all_agent_answers>\n{all_answers}\n</all_agent_answers>"
 
-        chain = llm.with_structured_output(AggregatorOutput)
-        res = chain.invoke([
+        chain = llm.with_structured_output(AggregatorOutput, include_raw=True)
+        messages = [
             ("system", system_prompt),
             ("human", f"Synthesize the final answer.\n\n{formatted_input}")
-        ])
+        ]
+        res = _invoke_with_logging(chain, messages, f"aggregator")
         return {"final_answer": res.final_answer}
 
     return node
@@ -298,8 +383,14 @@ def create_agent_eval_node(agent_id: str, llm, base_system_prompt: str):
     - INSUFFICIENT_JUSTIFICATION: Conclusion may be correct but weakly justified.
     - RANDOM_OR_UNGROUNDED: Arbitrary, speculative, or unsupported.
     - NONE: The answer is fully correct with no notable issues.
-
     If the answer is correct, choose NONE. Do NOT invent new labels.
+    
+    SCORING RUBRIC (1-5):
+    - 5 (Perfect): Correct answer with rigorous, domain-appropriate, and complete reasoning.
+    - 4 (Minor Flaw): Correct answer but reasoning has minor redundancies or slight terminology issues.
+    - 3 (Borderline): Correct answer but reasoning is weak/shallow, or Incorrect answer but showed some valid logical steps.
+    - 2 (Major Error): Incorrect answer with flawed reasoning or significant domain misconceptions.
+    - 1 (Total Failure): Incorrect answer and reasoning is completely irrelevant, ungrounded, or nonsensical.
     """
 
     system_prompt = base_system_prompt + instruction_appendix
@@ -314,11 +405,12 @@ def create_agent_eval_node(agent_id: str, llm, base_system_prompt: str):
             f"<agent_answer>\n{agent_answer_text}\n</agent_answer>"
         )
 
-        chain = llm.with_structured_output(AgentEvalOutput)
-        res = chain.invoke([
+        chain = llm.with_structured_output(AgentEvalOutput, include_raw=True)
+        messages = [
             ("system", system_prompt),
             ("human", f"Evaluate the agent's answer based on the medical multiple-choice question.\n\n{formatted_input}")
-        ])
+        ]
+        res = _invoke_with_logging(chain, messages, f"{agent_id}_eval")
 
         # 将评估结果追加到状态中
         evals = state.get("agent_evaluations", AgentEvalManager())
@@ -344,11 +436,12 @@ def create_agent_error_diagnosis_node(agent_id: str, llm, base_system_prompt: st
         evals = state.get("agent_evaluations", AgentEvalManager())
         formatted_input = evals.get_buffer(agent_id).summary_for_llm()
 
-        chain = llm.with_structured_output(AgentErrorDiagnosisOutput)
-        res = chain.invoke([
+        chain = llm.with_structured_output(AgentErrorDiagnosisOutput, include_raw=True)
+        messages = [
             ("system", system_prompt),
             ("human", f"Summarize the typical reasons for the agent's failures.\n\n{formatted_input}")
-        ])
+        ]
+        res = _invoke_with_logging(chain, messages, f"{agent_id}_error_diag")
 
         summaries = state.get("agent_error_summaries", {}).copy()
         summaries[agent_id] = res.attr_summary
@@ -383,11 +476,12 @@ def create_role_prompt_opt_node(agent_id: str, llm, base_system_prompt: str):
             f"<failure_summary>\n{failure_summary}\n</failure_summary>"
         )
 
-        chain = llm.with_structured_output(RolePromptOptOutput)
-        res = chain.invoke([
+        chain = llm.with_structured_output(RolePromptOptOutput, include_raw=True)
+        messages = [
             ("system", system_prompt),
             ("human", f"Diagnose and reconstruct the agent's role prompt.\n\n{formatted_input}")
-        ])
+        ]
+        res = _invoke_with_logging(chain, messages, f"{agent_id}_prompt_opt")
 
         prompts = state.get("agent_prompts", {}).copy()
         prompts[agent_id] = res.new_prompt
@@ -445,11 +539,12 @@ def create_agg_eval_node(agg_idx: int, llm, base_system_prompt: str):
             f"<aggregate_answer>\n{state['final_answer']}\n</aggregate_answer>"
         )
 
-        chain = llm.with_structured_output(AggEvalOutput)
-        res = chain.invoke([
+        chain = llm.with_structured_output(AggEvalOutput, include_raw=True)
+        messages = [
             ("system", system_prompt),
             ("human", f"Identify the Aggregator's mistakes and score its performance.\n\n{formatted_input}")
-        ])
+        ]
+        res = _invoke_with_logging(chain, messages, f"agg_{agg_idx}_eval")
 
         # 记录汇总评估结果
         evals = state.get("agg_evaluations")
@@ -487,11 +582,12 @@ def create_agg_error_diagnosis_node(agg_idx: int, llm, base_system_prompt: str):
             logging.warning("Can't diagnosis agg. No incorrect evaluations to diagnose.")
             return {"agg_error_diagnosis": None}
 
-        chain = llm.with_structured_output(AggErrorDiagnosisOutput)
-        res = chain.invoke([
+        chain = llm.with_structured_output(AggErrorDiagnosisOutput, include_raw=True)
+        messages = [
             ("system", system_prompt),
             ("human", f"Aggregate multiple round critiques into a concise, stable diagnosis.\n\n{formatted_input}")
-        ])
+        ]
+        res = _invoke_with_logging(chain, messages, f"agg_{agg_idx}_error_diag")
 
         return {"agg_error_diagnosis": res.critic_diagnosis}
 
@@ -533,11 +629,12 @@ def create_agg_prompt_opt_node(agg_idx: int, llm, base_system_prompt: str):
             f"<critic_diagnosis>\n{critic_diagnosis}\n</critic_diagnosis>"
         )
 
-        chain = llm.with_structured_output(AggPromptOptOutput)
-        res = chain.invoke([
+        chain = llm.with_structured_output(AggPromptOptOutput, include_raw=True)
+        messages = [
             ("system", system_prompt),
             ("human", f"Rewrite the Aggregator system prompt to fix the diagnosed behaviors.\n\n{formatted_input}")
-        ])
+        ]
+        res = _invoke_with_logging(chain, messages, f"agg_{agg_idx}_prompt_opt")
 
         new_prompts = list(agg_prompts)
         new_prompts[agg_idx] = res.new_prompt
