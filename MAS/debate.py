@@ -242,7 +242,9 @@ def train_workflow(trainset, max_epochs=3):
                     state = agg_opt_app.invoke(state)
                     # 更新全局变量
                     agg_prompts = state["agg_prompts"]
+                    epoch_agg_evals.agg_error_buffers[agg_idx] = []
                     epoch_agg_evals.need_opt[agg_idx] = False
+                    epoch_agg_evals.agg_credits[agg_idx] = 3.0
                     logging.info(f"[Updated Aggregator Prompt]:\n{agg_prompts[agg_idx]}\n")
 
                     # 使新的 Aggregator Prompt 立即在下一道题生效
