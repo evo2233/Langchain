@@ -1,5 +1,6 @@
 import json
 import logging
+import time
 from collections import defaultdict
 from typing import TypedDict, Dict, List, Optional
 
@@ -83,15 +84,25 @@ def _extract_structured_response(result, tag: str):
 
 def _invoke_with_logging(chain, messages: List[tuple], tag: str):
     _log_llm_messages(tag, messages)
-    try:
-        res = chain.invoke(messages)
-        parsed_res = _extract_structured_response(res, tag)
-        _log_llm_output(tag, parsed_res)
-        return parsed_res
-    except Exception as exc:
-        _log_invoke_exception(tag, exc)
-        logging.exception("[%s] LLM invoke failed.", tag)
-        raise
+    max_retries = 2
+
+    for attempt in range(max_retries + 1):
+        try:
+            res = chain.invoke(messages)
+            parsed_res = _extract_structured_response(res, tag)
+            _log_llm_output(tag, parsed_res)
+            return parsed_res
+        except Exception as exc:
+            _log_invoke_exception(tag, exc)
+            if attempt < max_retries:
+                logging.warning(
+                    "[%s] LLM invoke failed on attempt %s/%s. Retrying.",
+                    tag, attempt + 1, max_retries + 1
+                )
+                time.sleep(0.6 * (attempt + 1))
+                continue
+            logging.exception("[%s] LLM invoke failed.", tag)
+            raise
 
 
 def load_json_for_langgraph(
