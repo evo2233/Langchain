@@ -17,8 +17,6 @@ from node import (
     load_json_for_langgraph
 )
 
-PROMPT_SAVE_PATH = Path(__file__).resolve().parent / "optimized_prompts.json"
-
 
 def configure_logging(log_name: str = "training_log.txt") -> Path:
     log_path = Path(__file__).resolve().parent / log_name
@@ -314,7 +312,14 @@ def test_workflow(testset, agent_prompts: Dict[str, str], agg_prompts: List[str]
     return accuracy
 
 
-def save_optimized_prompts(agent_prompts: Dict[str, str], agg_prompts: List[str], path: Path = PROMPT_SAVE_PATH):
+def resolve_dataset_paths(dataset: str) -> Tuple[Path, Path]:
+    dataset_dir = Path(__file__).resolve().parent.parent / "data" / dataset
+    train_path = dataset_dir / f"{dataset}train.json"
+    test_path = dataset_dir / f"{dataset}test.json"
+    return train_path, test_path
+
+
+def save_optimized_prompts(agent_prompts: Dict[str, str], agg_prompts: List[str], path: Path):
     payload = {
         "agent_prompts": agent_prompts,
         "agg_prompts": agg_prompts,
@@ -324,7 +329,7 @@ def save_optimized_prompts(agent_prompts: Dict[str, str], agg_prompts: List[str]
     logging.info("Optimized prompts saved to %s", path)
 
 
-def load_optimized_prompts(path: Path = PROMPT_SAVE_PATH) -> Tuple[Dict[str, str], List[str]]:
+def load_optimized_prompts(path: Path) -> Tuple[Dict[str, str], List[str]]:
     with open(path, "r", encoding="utf-8") as f:
         payload = json.load(f)
 
@@ -340,14 +345,15 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Train/Test MAS debate workflow.")
     parser.add_argument("--mode", choices=["train", "test"], default="test")
     parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--prompt-path", type=str, default=str(PROMPT_SAVE_PATH))
+    parser.add_argument("--dataset", type=str, default="MedMCQA")
     args = parser.parse_args()
 
-    prompt_path = Path(args.prompt_path)
+    prompt_path = Path(f"./result/debate_{args.dataset}_optimized_prompts.json")
+    train_path, test_path = resolve_dataset_paths(args.dataset)
 
     if args.mode == "train":
-        configure_logging("training_log.txt")
-        trainset = load_json_for_langgraph(path="../data/MedMCQ/MedMCQAtrain.json")
+        configure_logging(f"debate_{args.dataset}_train_log.txt")
+        trainset = load_json_for_langgraph(path=str(train_path))
         final_agent_prompts, final_agg_prompts = train_workflow(trainset, max_epochs=args.epochs)
         save_optimized_prompts(final_agent_prompts, final_agg_prompts, prompt_path)
 
@@ -357,7 +363,7 @@ if __name__ == '__main__':
         for k, v in final_agent_prompts.items():
             print(f"{k}:\n{v}\n")
     else:
-        configure_logging("test_log.txt")
-        testset = load_json_for_langgraph(path="../data/MedMCQ/MedMCQAtest.json")
+        configure_logging(f"debate_{args.dataset}_test_log.txt")
+        testset = load_json_for_langgraph(path=str(test_path))
         final_agent_prompts, final_agg_prompts = load_optimized_prompts(prompt_path)
         test_workflow(testset, final_agent_prompts, final_agg_prompts)
