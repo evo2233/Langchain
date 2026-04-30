@@ -191,6 +191,33 @@ class AgentEvalBuffer:
 
         return xml_output
 
+    def to_dict(self):
+        return {
+            "total_sample_nums": self.total_sample_nums,
+            "correct_sample_nums": self.correct_sample_nums,
+            "scores": list(self.scores),
+            "max_examples": self.max_examples,
+            "category_stats": {
+                category: {
+                    "count": info.get("count", 0),
+                    "examples": list(info.get("examples", [])),
+                }
+                for category, info in self.category_stats.items()
+            },
+        }
+
+    @classmethod
+    def from_dict(cls, payload):
+        obj = cls(max_examples_per_category=payload.get("max_examples", 5))
+        obj.total_sample_nums = int(payload.get("total_sample_nums", 0))
+        obj.correct_sample_nums = int(payload.get("correct_sample_nums", 0))
+        obj.scores = list(payload.get("scores", []))
+        category_stats = payload.get("category_stats", {})
+        for category, info in category_stats.items():
+            obj.category_stats[category]["count"] = int(info.get("count", 0))
+            obj.category_stats[category]["examples"] = list(info.get("examples", []))
+        return obj
+
 
 class AgentEvalManager:
     def __init__(self):
@@ -254,6 +281,29 @@ class AgentEvalManager:
             self.need_opt.setdefault(agent_id, False)
         return self.agent_evals[agent_id]
 
+    def to_dict(self):
+        return {
+            "agent_evals": {
+                agent_id: eval_buffer.to_dict()
+                for agent_id, eval_buffer in self.agent_evals.items()
+            },
+            "need_opt": dict(self.need_opt),
+            "optimize_top_k": self.optimize_top_k,
+            "alpha": self.alpha,
+            "beta": self.beta,
+        }
+
+    @classmethod
+    def from_dict(cls, payload):
+        obj = cls()
+        obj.need_opt = dict(payload.get("need_opt", {}))
+        obj.optimize_top_k = int(payload.get("optimize_top_k", 2))
+        obj.alpha = float(payload.get("alpha", 0.6))
+        obj.beta = float(payload.get("beta", 0.4))
+        for agent_id, buffer_payload in payload.get("agent_evals", {}).items():
+            obj.agent_evals[agent_id] = AgentEvalBuffer.from_dict(buffer_payload)
+        return obj
+
 
 class AggEvalManager:
     """管理 agg_credits"""
@@ -296,8 +346,14 @@ class AggEvalManager:
         xml_output = "<failure_analysis>\n"
 
         for result in self.agg_error_buffers[agg_idx]:
-            xml_output += f'    <category>{getattr(result, "failure_category", "")}</category>\n'
-            xml_output += f'    <description>{getattr(result, "explanation", "")}</description>\n'
+            if isinstance(result, dict):
+                category = result.get("failure_category", "")
+                explanation = result.get("explanation", "")
+            else:
+                category = getattr(result, "failure_category", "")
+                explanation = getattr(result, "explanation", "")
+            xml_output += f'    <category>{category}</category>\n'
+            xml_output += f'    <description>{explanation}</description>\n'
 
         xml_output += "</failure_analysis>"
         if self.debugflag:
@@ -305,6 +361,39 @@ class AggEvalManager:
             logging.info(f"input to agg diagnosis:\n{xml_output}")
 
         return xml_output
+
+    def to_dict(self):
+        return {
+            "agg_credits": list(self.agg_credits),
+            "agg_error_buffers": [
+                [
+                    {
+                        "correctness": getattr(result, "correctness", ""),
+                        "failure_category": getattr(result, "failure_category", ""),
+                        "explanation": getattr(result, "explanation", ""),
+                        "score": getattr(result, "score", 0),
+                    }
+                    for result in bucket
+                ]
+                for bucket in self.agg_error_buffers
+            ],
+            "need_opt": list(self.need_opt),
+            "learn_rate": self.learn_rate,
+            "optimize_threshold": self.optimize_threshold,
+            "min_errors_before_opt": self.min_errors_before_opt,
+        }
+
+    @classmethod
+    def from_dict(cls, payload):
+        credits = payload.get("agg_credits", [3.0, 3.0, 3.0])
+        obj = cls(num_rounds=len(credits))
+        obj.agg_credits = [float(v) for v in credits]
+        obj.need_opt = [bool(v) for v in payload.get("need_opt", [False] * len(obj.agg_credits))]
+        obj.learn_rate = float(payload.get("learn_rate", 0.2))
+        obj.optimize_threshold = float(payload.get("optimize_threshold", 3.5))
+        obj.min_errors_before_opt = int(payload.get("min_errors_before_opt", 15))
+        obj.agg_error_buffers = payload.get("agg_error_buffers", [[] for _ in range(len(obj.agg_credits))])
+        return obj
 
 
 class DebateState(TypedDict):
