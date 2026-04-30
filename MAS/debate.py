@@ -185,7 +185,43 @@ def build_agg_opt_graph(agg_idx: int):
 # 2. 训练主循环
 # ==========================================
 
-def train_workflow(trainset, max_epochs=3):
+def save_training_snapshot(
+    snapshot_path: Path,
+    epoch: int,
+    next_example_idx: int,
+    global_prompts: Dict[str, str],
+    agg_prompts: List[str],
+    epoch_agent_evals: AgentEvalManager,
+    epoch_agg_evals: AggEvalManager,
+):
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "epoch": epoch,
+        "next_example_idx": next_example_idx,
+        "global_prompts": global_prompts,
+        "agg_prompts": agg_prompts,
+        "epoch_agent_evals": epoch_agent_evals.to_dict(),
+        "epoch_agg_evals": epoch_agg_evals.to_dict(),
+    }
+    with open(snapshot_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    logging.info("Training snapshot saved: %s", snapshot_path)
+
+
+def load_training_snapshot(snapshot_path: Path):
+    with open(snapshot_path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    return {
+        "epoch": int(payload["epoch"]),
+        "next_example_idx": int(payload["next_example_idx"]),
+        "global_prompts": payload["global_prompts"],
+        "agg_prompts": payload["agg_prompts"],
+        "epoch_agent_evals": AgentEvalManager.from_dict(payload.get("epoch_agent_evals", {})),
+        "epoch_agg_evals": AggEvalManager.from_dict(payload.get("epoch_agg_evals", {})),
+    }
+
+
+def train_workflow(trainset, max_epochs=3, snapshot_path: Path = None, resume: bool = False):
     # 1. 初始提示词配置
     global_prompts = {
         "agent_1": "You are an economist. Consider the following problem from an economic perspective.",
@@ -196,17 +232,39 @@ def train_workflow(trainset, max_epochs=3):
         "You are a summarizing agent, used to summarize the agents' responses and provide a final answer."
     agg_prompts = [agg_origin_prompt, agg_origin_prompt, agg_origin_prompt]
 
-    for epoch in range(max_epochs):
+    start_epoch = 0
+    start_example_idx = 0
+    if resume:
+        if snapshot_path is None or not snapshot_path.exists():
+            raise FileNotFoundError(f"Resume requested but snapshot not found: {snapshot_path}")
+        snapshot = load_training_snapshot(snapshot_path)
+        start_epoch = snapshot["epoch"]
+        start_example_idx = snapshot["next_example_idx"]
+        global_prompts = snapshot["global_prompts"]
+        agg_prompts = snapshot["agg_prompts"]
+        logging.info(
+            "Resuming training from epoch=%s, example_idx=%s using snapshot=%s",
+            start_epoch + 1, start_example_idx + 1, snapshot_path
+        )
+
+    for epoch in range(start_epoch, max_epochs):
         logging.info(f"\n========== Epoch {epoch + 1}/{max_epochs} ==========")
 
         # 每轮 Epoch 开始，用最新 Prompts 重新编译【前向图】，避免静态 Prompt 写死在 Node 闭包中
         forward_app = build_forward_eval_graph(global_prompts, agg_prompts)
 
         # 初始化当前 Epoch 的评估缓存
-        epoch_agent_evals = AgentEvalManager()
-        epoch_agg_evals = AggEvalManager()
+        if resume and epoch == start_epoch:
+            epoch_agent_evals = snapshot["epoch_agent_evals"]
+            epoch_agg_evals = snapshot["epoch_agg_evals"]
+            example_range = range(start_example_idx, len(trainset))
+        else:
+            epoch_agent_evals = AgentEvalManager()
+            epoch_agg_evals = AggEvalManager()
+            example_range = range(len(trainset))
 
-        for i, ex in enumerate(trainset):
+        for i in example_range:
+            ex = trainset[i]
             logging.info(f"--- Training Example {i + 1}/{len(trainset)} ---")
 
             # 挂载单题的初始状态
@@ -224,7 +282,21 @@ def train_workflow(trainset, max_epochs=3):
             }
 
             # --- A. 执行前向辩论与评估 ---
-            state = forward_app.invoke(state)
+            try:
+                state = forward_app.invoke(state)
+            except Exception:
+                if snapshot_path is not None:
+                    save_training_snapshot(
+                        snapshot_path=snapshot_path,
+                        epoch=epoch,
+                        next_example_idx=i,
+                        global_prompts=global_prompts,
+                        agg_prompts=agg_prompts,
+                        epoch_agent_evals=epoch_agent_evals,
+                        epoch_agg_evals=epoch_agg_evals,
+                    )
+                logging.exception("Training interrupted at epoch=%s, example=%s", epoch + 1, i + 1)
+                raise
             logging.info(f"Question completed. Final Aggregated Answer: {state['final_answer'][:50]}...")
 
             # 累积当前状态的 Evaluation 供后续分析
@@ -247,6 +319,24 @@ def train_workflow(trainset, max_epochs=3):
 
                     # 使新的 Aggregator Prompt 立即在下一道题生效
                     forward_app = build_forward_eval_graph(global_prompts, agg_prompts)
+
+            if snapshot_path is not None:
+                next_example_idx = i + 1
+                next_epoch = epoch
+                if next_example_idx >= len(trainset):
+                    next_example_idx = 0
+                    next_epoch = epoch + 1
+                save_training_snapshot(
+                    snapshot_path=snapshot_path,
+                    epoch=next_epoch,
+                    next_example_idx=next_example_idx,
+                    global_prompts=global_prompts,
+                    agg_prompts=agg_prompts,
+                    epoch_agent_evals=epoch_agent_evals,
+                    epoch_agg_evals=epoch_agg_evals,
+                )
+
+        resume = False
 
         # --- C. Spatial Optimization (Agent 周期更新) ---
         logging.info("\nEnd of Epoch. Triggering Spatial Optimization for Agents...")
@@ -346,6 +436,8 @@ if __name__ == '__main__':
     parser.add_argument("--mode", choices=["train", "test"], default="test")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--dataset", type=str, default="MedMCQA")
+    parser.add_argument("--resume", action="store_true", help="Resume train mode from snapshot.")
+    parser.add_argument("--snapshot-path", type=str, default=None, help="Path to training snapshot json.")
     args = parser.parse_args()
 
     prompt_path = Path(f"./result/debate_{args.dataset}_optimized_prompts.json")
@@ -354,7 +446,13 @@ if __name__ == '__main__':
     if args.mode == "train":
         configure_logging(f"debate_{args.dataset}_train_log.txt")
         trainset = load_json_for_langgraph(path=str(train_path))
-        final_agent_prompts, final_agg_prompts = train_workflow(trainset, max_epochs=args.epochs)
+        snapshot_path = Path(args.snapshot_path) if args.snapshot_path else Path(f"./result/debate_{args.dataset}_train_snapshot.json")
+        final_agent_prompts, final_agg_prompts = train_workflow(
+            trainset,
+            max_epochs=args.epochs,
+            snapshot_path=snapshot_path,
+            resume=args.resume,
+        )
         save_optimized_prompts(final_agent_prompts, final_agg_prompts, prompt_path)
 
         print("\n\n=== Final Optimized Prompts ===")
