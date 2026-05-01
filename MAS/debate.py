@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+from langchain_community.callbacks.manager import get_openai_callback
 from langchain_openai import ChatOpenAI
 from langgraph.constants import END
 from langgraph.graph import StateGraph
@@ -293,141 +294,150 @@ def train_workflow(llm, train_set, validation_set, max_epochs=3, snapshot_path: 
             start_epoch + 1, start_example_idx + 1, snapshot_path
         )
 
-    for epoch in range(start_epoch, max_epochs):
-        logging.info(f"\n========== Epoch {epoch + 1}/{max_epochs} ==========")
+    with get_openai_callback() as cb:
+        for epoch in range(start_epoch, max_epochs):
+            logging.info(f"\n========== Epoch {epoch + 1}/{max_epochs} ==========")
 
-        # 每轮 Epoch 开始，用最新 Prompts 重新编译【前向图】，避免静态 Prompt 写死在 Node 闭包中
-        forward_app = build_forward_eval_graph(llm, global_prompts, agg_prompts)
+            # 每轮 Epoch 开始，用最新 Prompts 重新编译【前向图】，避免静态 Prompt 写死在 Node 闭包中
+            forward_app = build_forward_eval_graph(llm, global_prompts, agg_prompts)
 
-        # 初始化当前 Epoch 的评估缓存
-        if resume and epoch == start_epoch:
-            epoch_agent_evals = snapshot["epoch_agent_evals"]
-            epoch_agg_evals = snapshot["epoch_agg_evals"]
-            example_range = range(start_example_idx, len(train_set))
-        else:
-            epoch_agent_evals = AgentEvalManager()
-            epoch_agg_evals = AggEvalManager()
-            example_range = range(len(train_set))
+            # 初始化当前 Epoch 的评估缓存
+            if resume and epoch == start_epoch:
+                epoch_agent_evals = snapshot["epoch_agent_evals"]
+                epoch_agg_evals = snapshot["epoch_agg_evals"]
+                example_range = range(start_example_idx, len(train_set))
+            else:
+                epoch_agent_evals = AgentEvalManager()
+                epoch_agg_evals = AggEvalManager()
+                example_range = range(len(train_set))
 
-        for i in example_range:
-            ex = train_set[i]
-            logging.info(f"--- Training Example {i + 1}/{len(train_set)} ---")
+            for i in example_range:
+                ex = train_set[i]
+                logging.info(f"--- Training Example {i + 1}/{len(train_set)} ---")
 
-            # 挂载单题的初始状态
-            state: DebateState = {
-                "question": ex["question"],
-                "correct_answer": ex["correct_answer"],
-                "responses": {"agent_1": {}, "agent_2": {}, "agent_3": {}},
-                "final_answer": "",
-                "agent_evaluations": epoch_agent_evals,
-                "agent_error_summaries": {},
-                "agent_prompts": global_prompts.copy(),
-                "agg_evaluations": epoch_agg_evals,
-                "agg_error_diagnosis": "",
-                "agg_prompts": agg_prompts
-            }
+                # 挂载单题的初始状态
+                state: DebateState = {
+                    "question": ex["question"],
+                    "correct_answer": ex["correct_answer"],
+                    "responses": {"agent_1": {}, "agent_2": {}, "agent_3": {}},
+                    "final_answer": "",
+                    "agent_evaluations": epoch_agent_evals,
+                    "agent_error_summaries": {},
+                    "agent_prompts": global_prompts.copy(),
+                    "agg_evaluations": epoch_agg_evals,
+                    "agg_error_diagnosis": "",
+                    "agg_prompts": agg_prompts
+                }
 
-            # --- A. 执行前向辩论与评估 ---
-            try:
-                state = forward_app.invoke(state)
-            except Exception:
+                # --- A. 执行前向辩论与评估 ---
+                try:
+                    state = forward_app.invoke(state)
+                except Exception:
+                    if snapshot_path is not None:
+                        save_training_snapshot(
+                            snapshot_path=snapshot_path,
+                            epoch=epoch,
+                            next_example_idx=i,
+                            global_prompts=global_prompts,
+                            agg_prompts=agg_prompts,
+                            epoch_agent_evals=epoch_agent_evals,
+                            epoch_agg_evals=epoch_agg_evals,
+                        )
+                    logging.exception("Training interrupted at epoch=%s, example=%s", epoch + 1, i + 1)
+                    raise
+                logging.info(f"Question completed. Final Aggregated Answer: {state['final_answer'][:50]}...")
+
+                # 累积当前状态的 Evaluation 供后续分析
+                epoch_agent_evals = state["agent_evaluations"]
+                epoch_agg_evals = state["agg_evaluations"]
+
+                # --- B. Temporal Optimization (Aggregator 实时更新) ---
+                for agg_idx, _ in enumerate(agg_prompts):
+                    if epoch_agg_evals.need_opt[agg_idx]:
+                        logging.info("Aggregator performance is poor. Triggering Temporal Optimization...")
+                        agg_opt_app = build_agg_opt_graph(llm, agg_idx)
+
+                        old_agg_prompts = list(agg_prompts)
+                        state = agg_opt_app.invoke(state)
+
+                        _run_prompt_update_validation(
+                            llm,
+                            validation_set,
+                            global_prompts,
+                            old_agg_prompts,
+                            epoch_agent_evals,
+                            epoch_agg_evals,
+                            trigger_source=f"aggregator_round_{agg_idx + 1}",
+                        )
+
+                        # 更新全局变量
+                        agg_prompts = state["agg_prompts"]
+                        epoch_agg_evals.agg_error_buffers[agg_idx] = []
+                        epoch_agg_evals.need_opt[agg_idx] = False
+                        epoch_agg_evals.agg_credits[agg_idx] = 3.0
+                        logging.info(f"[Updated Aggregator Prompt]:\n{agg_prompts[agg_idx]}\n")
+
+                        # 使新的 Aggregator Prompt 立即在下一道题生效
+                        forward_app = build_forward_eval_graph(llm, global_prompts, agg_prompts)
+
                 if snapshot_path is not None:
+                    next_example_idx = i + 1
+                    next_epoch = epoch
+                    if next_example_idx >= len(train_set):
+                        next_example_idx = 0
+                        next_epoch = epoch + 1
                     save_training_snapshot(
                         snapshot_path=snapshot_path,
-                        epoch=epoch,
-                        next_example_idx=i,
+                        epoch=next_epoch,
+                        next_example_idx=next_example_idx,
                         global_prompts=global_prompts,
                         agg_prompts=agg_prompts,
                         epoch_agent_evals=epoch_agent_evals,
                         epoch_agg_evals=epoch_agg_evals,
                     )
-                logging.exception("Training interrupted at epoch=%s, example=%s", epoch + 1, i + 1)
-                raise
-            logging.info(f"Question completed. Final Aggregated Answer: {state['final_answer'][:50]}...")
+            resume = False
 
-            # 累积当前状态的 Evaluation 供后续分析
-            epoch_agent_evals = state["agent_evaluations"]
-            epoch_agg_evals = state["agg_evaluations"]
+            # --- C. Spatial Optimization (Agent 周期更新) ---
+            logging.info("\nEnd of Epoch. Triggering Spatial Optimization for Agents...")
 
-            # --- B. Temporal Optimization (Aggregator 实时更新) ---
-            for agg_idx, _ in enumerate(agg_prompts):
-                if epoch_agg_evals.need_opt[agg_idx]:
-                    logging.info("Aggregator performance is poor. Triggering Temporal Optimization...")
-                    agg_opt_app = build_agg_opt_graph(llm, agg_idx)
+            epoch_agent_evals.refresh_need_opt()
+            for agent_id in ["agent_1", "agent_2", "agent_3"]:
+                if epoch_agent_evals.need_opt.get(agent_id, False):
+                    logging.info(f"Agent [{agent_id}]. Optimizing...")
+                    agent_opt_app = build_agent_opt_graph(llm, agent_id)
 
-                    old_agg_prompts = list(agg_prompts)
-                    state = agg_opt_app.invoke(state)
+                    opt_state: DebateState = {
+                        "question": "", "correct_answer": "", "responses": {}, "final_answer": "",
+                        "agent_evaluations": epoch_agent_evals,
+                        "agent_error_summaries": {},
+                        "agent_prompts": global_prompts.copy(),
+                        "agg_evaluations": epoch_agg_evals, "agg_error_diagnosis": "", "agg_prompts": agg_prompts
+                    }
+                    old_agent_prompts = global_prompts.copy()
+                    opt_state = agent_opt_app.invoke(opt_state)
 
                     _run_prompt_update_validation(
                         llm,
                         validation_set,
-                        global_prompts,
-                        old_agg_prompts,
+                        old_agent_prompts,
+                        agg_prompts,
                         epoch_agent_evals,
                         epoch_agg_evals,
-                        trigger_source=f"aggregator_round_{agg_idx + 1}",
+                        trigger_source=agent_id,
                     )
 
-                    # 更新全局变量
-                    agg_prompts = state["agg_prompts"]
-                    epoch_agg_evals.agg_error_buffers[agg_idx] = []
-                    epoch_agg_evals.need_opt[agg_idx] = False
-                    epoch_agg_evals.agg_credits[agg_idx] = 3.0
-                    logging.info(f"[Updated Aggregator Prompt]:\n{agg_prompts[agg_idx]}\n")
+                    # 应用更新
+                    global_prompts[agent_id] = opt_state["agent_prompts"][agent_id]
+                    logging.info(f"[Updated Agent {agent_id} Prompt]:\n{global_prompts[agent_id]}\n")
 
-                    # 使新的 Aggregator Prompt 立即在下一道题生效
-                    forward_app = build_forward_eval_graph(llm, global_prompts, agg_prompts)
-
-            if snapshot_path is not None:
-                next_example_idx = i + 1
-                next_epoch = epoch
-                if next_example_idx >= len(train_set):
-                    next_example_idx = 0
-                    next_epoch = epoch + 1
-                save_training_snapshot(
-                    snapshot_path=snapshot_path,
-                    epoch=next_epoch,
-                    next_example_idx=next_example_idx,
-                    global_prompts=global_prompts,
-                    agg_prompts=agg_prompts,
-                    epoch_agent_evals=epoch_agent_evals,
-                    epoch_agg_evals=epoch_agg_evals,
-                )
-
-        resume = False
-
-        # --- C. Spatial Optimization (Agent 周期更新) ---
-        logging.info("\nEnd of Epoch. Triggering Spatial Optimization for Agents...")
-
-        epoch_agent_evals.refresh_need_opt()
-        for agent_id in ["agent_1", "agent_2", "agent_3"]:
-            if epoch_agent_evals.need_opt.get(agent_id, False):
-                logging.info(f"Agent [{agent_id}]. Optimizing...")
-                agent_opt_app = build_agent_opt_graph(llm, agent_id)
-
-                opt_state: DebateState = {
-                    "question": "", "correct_answer": "", "responses": {}, "final_answer": "",
-                    "agent_evaluations": epoch_agent_evals,
-                    "agent_error_summaries": {},
-                    "agent_prompts": global_prompts.copy(),
-                    "agg_evaluations": epoch_agg_evals, "agg_error_diagnosis": "", "agg_prompts": agg_prompts
-                }
-                old_agent_prompts = global_prompts.copy()
-                opt_state = agent_opt_app.invoke(opt_state)
-
-                _run_prompt_update_validation(
-                    llm,
-                    validation_set,
-                    old_agent_prompts,
-                    agg_prompts,
-                    epoch_agent_evals,
-                    epoch_agg_evals,
-                    trigger_source=agent_id,
-                )
-
-                # 应用更新
-                global_prompts[agent_id] = opt_state["agent_prompts"][agent_id]
-                logging.info(f"[Updated Agent {agent_id} Prompt]:\n{global_prompts[agent_id]}\n")
+        logging.info(
+            "Training token usage summary: prompt_tokens=%s completion_tokens=%s total_tokens=%s successful_requests=%s total_cost=%s",
+            cb.prompt_tokens,
+            cb.completion_tokens,
+            cb.total_tokens,
+            cb.successful_requests,
+            cb.total_cost,
+        )
 
     logging.info("Training Completed.")
     return global_prompts, agg_prompts
@@ -467,7 +477,7 @@ def test_workflow(llm, test_set, agent_prompts: Dict[str, str], agg_prompts: Lis
         )
 
     accuracy = correct / total if total else 0.0
-    logging.info("[TEST] Accuracy on MedMCQAtest: %.4f (%d/%d)", accuracy, correct, total)
+    logging.info("[TEST] Accuracy on test set: %.4f (%d/%d)", accuracy, correct, total)
     return accuracy
 
 
