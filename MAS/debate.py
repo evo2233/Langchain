@@ -17,6 +17,13 @@ from node import (
     load_json_for_langgraph
 )
 
+AGENT_ORIGIN_PROMPTS = {
+    "agent_1": "You are an economist. Consider the following problem from an economic perspective.",
+    "agent_2": "You are an engineer. Analyze and solve the following problem from a technical viewpoint.",
+    "agent_3": "You are an ethicist. Reflect on the following issue from an ethical standpoint.",
+}
+AGG_ORIGIN_PROMPT = \
+    "You are a summarizing agent, used to summarize the agents' responses and provide a final answer."
 EVAL_BASE_PROMPT = "You are an expert evaluator. Please complete the task according to the requirements below."
 OPT_BASE_PROMPT = "You are an expert prompt optimizer. Please provide prompts that match the rule below."
 
@@ -223,15 +230,8 @@ def load_training_snapshot(snapshot_path: Path):
 
 
 def train_workflow(llm, trainset, max_epochs=3, snapshot_path: Path = None, resume: bool = False):
-    # 1. 初始提示词配置
-    global_prompts = {
-        "agent_1": "You are an economist. Consider the following problem from an economic perspective.",
-        "agent_2": "You are an engineer. Analyze and solve the following problem from a technical viewpoint.",
-        "agent_3": "You are an ethicist. Reflect on the following issue from an ethical standpoint.",
-    }
-    agg_origin_prompt = \
-        "You are a summarizing agent, used to summarize the agents' responses and provide a final answer."
-    agg_prompts = [agg_origin_prompt, agg_origin_prompt, agg_origin_prompt]
+    global_prompts = AGENT_ORIGIN_PROMPTS
+    agg_prompts = [AGG_ORIGIN_PROMPT] * 3
 
     start_epoch = 0
     start_example_idx = 0
@@ -435,11 +435,11 @@ def load_optimized_prompts(path: Path) -> Tuple[Dict[str, str], List[str]]:
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Train/Test MAS debate workflow.")
     parser.add_argument("--mode", choices=["train", "test"], default="test")
+    parser.add_argument("--no_opt", action="store_true", help="Use no optimize prompt for test mode")
+    parser.add_argument("--resume", action="store_true", help="Resume train mode from snapshot.")
     parser.add_argument("--gpu_id", type=int, default=5)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--dataset", type=str, default="MedMCQA")
-    parser.add_argument("--resume", action="store_true", help="Resume train mode from snapshot.")
-    parser.add_argument("--snapshot-path", type=str, default=None, help="Path to training snapshot json.")
     args = parser.parse_args()
 
     llm = load_llm(args.gpu_id)
@@ -449,7 +449,7 @@ if __name__ == '__main__':
     if args.mode == "train":
         configure_logging(f"debate_{args.dataset}_train_log.txt")
         trainset = load_json_for_langgraph(path=str(train_path))
-        snapshot_path = Path(args.snapshot_path) if args.snapshot_path else Path(f"./result/debate_{args.dataset}_train_snapshot.json")
+        snapshot_path = Path(f"./result/debate_{args.dataset}_train_snapshot.json")
         final_agent_prompts, final_agg_prompts = train_workflow(
             llm,
             trainset,
@@ -467,5 +467,9 @@ if __name__ == '__main__':
     else:
         configure_logging(f"debate_{args.dataset}_test_log.txt")
         testset = load_json_for_langgraph(path=str(test_path))
-        final_agent_prompts, final_agg_prompts = load_optimized_prompts(prompt_path)
+        if args.no_opt:
+            final_agent_prompts = AGENT_ORIGIN_PROMPTS
+            final_agg_prompts = [AGG_ORIGIN_PROMPT] * 3
+        else:
+            final_agent_prompts, final_agg_prompts = load_optimized_prompts(prompt_path)
         test_workflow(llm, testset, final_agent_prompts, final_agg_prompts)

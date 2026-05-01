@@ -34,6 +34,7 @@ for DATASET in "${DATASETS[@]}"; do
   echo "[1/2] Start training workflow (epochs=${EPOCHS})"
   "${PYTHON_BIN}" "${SCRIPT_DIR}/debate.py" \
     --mode train \
+    --resume \
     --epochs "${EPOCHS}" \
     --dataset "${DATASET}"
 
