@@ -275,7 +275,15 @@ def _run_prompt_update_validation(
     logging.info('[PROMPT_UPDATE_VALIDATION] %s', json.dumps(credit_payload, ensure_ascii=False))
 
 
-def train_workflow(llm, train_set, validation_set, max_epochs=3, snapshot_path: Path = None, resume: bool = False):
+def train_workflow(
+    llm,
+    train_set,
+    validation_set,
+    max_epochs=3,
+    snapshot_path: Path = None,
+    resume: bool = False,
+    optimization_mode: str = "Both",
+):
     global_prompts = AGENT_ORIGIN_PROMPTS
     agg_prompts = [AGG_ORIGIN_PROMPT] * 3
 
@@ -293,6 +301,9 @@ def train_workflow(llm, train_set, validation_set, max_epochs=3, snapshot_path: 
             "Resuming training from epoch=%s, example_idx=%s using snapshot=%s",
             start_epoch + 1, start_example_idx + 1, snapshot_path
         )
+
+    run_temporal_optimization = optimization_mode in {"Both", "Temporal"}
+    run_spatial_optimization = optimization_mode in {"Both", "Spatial"}
 
     with get_openai_callback() as cb:
         for epoch in range(start_epoch, max_epochs):
@@ -352,33 +363,36 @@ def train_workflow(llm, train_set, validation_set, max_epochs=3, snapshot_path: 
                 epoch_agg_evals = state["agg_evaluations"]
 
                 # --- B. Temporal Optimization (Aggregator 实时更新) ---
-                for agg_idx, _ in enumerate(agg_prompts):
-                    if epoch_agg_evals.need_opt[agg_idx]:
-                        logging.info("Aggregator performance is poor. Triggering Temporal Optimization...")
-                        agg_opt_app = build_agg_opt_graph(llm, agg_idx)
+                if run_temporal_optimization:
+                    for agg_idx, _ in enumerate(agg_prompts):
+                        if epoch_agg_evals.need_opt[agg_idx]:
+                            logging.info("Aggregator performance is poor. Triggering Temporal Optimization...")
+                            agg_opt_app = build_agg_opt_graph(llm, agg_idx)
 
-                        old_agg_prompts = list(agg_prompts)
-                        state = agg_opt_app.invoke(state)
+                            old_agg_prompts = list(agg_prompts)
+                            state = agg_opt_app.invoke(state)
 
-                        _run_prompt_update_validation(
-                            llm,
-                            validation_set,
-                            global_prompts,
-                            old_agg_prompts,
-                            epoch_agent_evals,
-                            epoch_agg_evals,
-                            trigger_source=f"aggregator_round_{agg_idx + 1}",
-                        )
+                            _run_prompt_update_validation(
+                                llm,
+                                validation_set,
+                                global_prompts,
+                                old_agg_prompts,
+                                epoch_agent_evals,
+                                epoch_agg_evals,
+                                trigger_source=f"aggregator_round_{agg_idx + 1}",
+                            )
 
-                        # 更新全局变量
-                        agg_prompts = state["agg_prompts"]
-                        epoch_agg_evals.agg_error_buffers[agg_idx] = []
-                        epoch_agg_evals.need_opt[agg_idx] = False
-                        epoch_agg_evals.agg_credits[agg_idx] = 3.0
-                        logging.info(f"[Updated Aggregator Prompt]:\n{agg_prompts[agg_idx]}\n")
+                            # 更新全局变量
+                            agg_prompts = state["agg_prompts"]
+                            epoch_agg_evals.agg_error_buffers[agg_idx] = []
+                            epoch_agg_evals.need_opt[agg_idx] = False
+                            epoch_agg_evals.agg_credits[agg_idx] = 3.0
+                            logging.info(f"[Updated Aggregator Prompt]:\n{agg_prompts[agg_idx]}\n")
 
-                        # 使新的 Aggregator Prompt 立即在下一道题生效
-                        forward_app = build_forward_eval_graph(llm, global_prompts, agg_prompts)
+                            # 使新的 Aggregator Prompt 立即在下一道题生效
+                            forward_app = build_forward_eval_graph(llm, global_prompts, agg_prompts)
+                else:
+                    logging.info("Temporal Optimization disabled by optimization_mode=%s", optimization_mode)
 
                 if snapshot_path is not None:
                     next_example_idx = i + 1
@@ -398,37 +412,40 @@ def train_workflow(llm, train_set, validation_set, max_epochs=3, snapshot_path: 
             resume = False
 
             # --- C. Spatial Optimization (Agent 周期更新) ---
-            logging.info("\nEnd of Epoch. Triggering Spatial Optimization for Agents...")
+            if run_spatial_optimization:
+                logging.info("\nEnd of Epoch. Triggering Spatial Optimization for Agents...")
 
-            epoch_agent_evals.refresh_need_opt()
-            for agent_id in ["agent_1", "agent_2", "agent_3"]:
-                if epoch_agent_evals.need_opt.get(agent_id, False):
-                    logging.info(f"Agent [{agent_id}]. Optimizing...")
-                    agent_opt_app = build_agent_opt_graph(llm, agent_id)
+                epoch_agent_evals.refresh_need_opt()
+                for agent_id in ["agent_1", "agent_2", "agent_3"]:
+                    if epoch_agent_evals.need_opt.get(agent_id, False):
+                        logging.info(f"Agent [{agent_id}]. Optimizing...")
+                        agent_opt_app = build_agent_opt_graph(llm, agent_id)
 
-                    opt_state: DebateState = {
-                        "question": "", "correct_answer": "", "responses": {}, "final_answer": "",
-                        "agent_evaluations": epoch_agent_evals,
-                        "agent_error_summaries": {},
-                        "agent_prompts": global_prompts.copy(),
-                        "agg_evaluations": epoch_agg_evals, "agg_error_diagnosis": "", "agg_prompts": agg_prompts
-                    }
-                    old_agent_prompts = global_prompts.copy()
-                    opt_state = agent_opt_app.invoke(opt_state)
+                        opt_state: DebateState = {
+                            "question": "", "correct_answer": "", "responses": {}, "final_answer": "",
+                            "agent_evaluations": epoch_agent_evals,
+                            "agent_error_summaries": {},
+                            "agent_prompts": global_prompts.copy(),
+                            "agg_evaluations": epoch_agg_evals, "agg_error_diagnosis": "", "agg_prompts": agg_prompts
+                        }
+                        old_agent_prompts = global_prompts.copy()
+                        opt_state = agent_opt_app.invoke(opt_state)
 
-                    _run_prompt_update_validation(
-                        llm,
-                        validation_set,
-                        old_agent_prompts,
-                        agg_prompts,
-                        epoch_agent_evals,
-                        epoch_agg_evals,
-                        trigger_source=agent_id,
-                    )
+                        _run_prompt_update_validation(
+                            llm,
+                            validation_set,
+                            old_agent_prompts,
+                            agg_prompts,
+                            epoch_agent_evals,
+                            epoch_agg_evals,
+                            trigger_source=agent_id,
+                        )
 
-                    # 应用更新
-                    global_prompts[agent_id] = opt_state["agent_prompts"][agent_id]
-                    logging.info(f"[Updated Agent {agent_id} Prompt]:\n{global_prompts[agent_id]}\n")
+                        # 应用更新
+                        global_prompts[agent_id] = opt_state["agent_prompts"][agent_id]
+                        logging.info(f"[Updated Agent {agent_id} Prompt]:\n{global_prompts[agent_id]}\n")
+            else:
+                logging.info("Spatial Optimization disabled by optimization_mode=%s", optimization_mode)
 
         logging.info(
             "Training token usage summary: prompt_tokens=%s completion_tokens=%s total_tokens=%s successful_requests=%s total_cost=%s",
@@ -518,6 +535,12 @@ if __name__ == '__main__':
     parser.add_argument("--gpu_id", type=int, default=5)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--dataset", type=str, default="MedMCQA")
+    parser.add_argument(
+        "--optimization_mode",
+        choices=["Both", "Temporal", "Spatial"],
+        default="Both",
+        help="Training optimization mode: Both (default), Temporal only, or Spatial only.",
+    )
     args = parser.parse_args()
 
     llm = load_llm(args.gpu_id)
@@ -538,6 +561,7 @@ if __name__ == '__main__':
             max_epochs=args.epochs,
             snapshot_path=snapshot_path,
             resume=args.resume,
+            optimization_mode=args.optimization_mode,
         )
         save_optimized_prompts(final_agent_prompts, final_agg_prompts, prompt_path)
 
