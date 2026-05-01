@@ -223,6 +223,7 @@ class AgentEvalManager:
     def __init__(self):
         self.agent_evals: Dict[str, AgentEvalBuffer] = {}
         self.need_opt: Dict[str, bool] = {}
+        self.agent_risks: Dict[str, float] = {}
         self.optimize_top_k = 2
         self.alpha = 0.6  # Mean score weight
         self.beta = 0.4  # Low score ratio weight
@@ -232,6 +233,16 @@ class AgentEvalManager:
             self.agent_evals[agent_id] = AgentEvalBuffer()
 
         self.agent_evals[agent_id].update(eval_result)
+
+    def compute_risk(self, agent_id: str) -> float:
+        buffer = self.agent_evals.get(agent_id)
+        if not buffer or buffer.total_sample_nums == 0:
+            return 0.0
+
+        mean_score = sum(buffer.scores) / buffer.total_sample_nums
+        low_score_ratio = sum(1 for s in buffer.scores if s <= 2) / buffer.total_sample_nums
+        normalized_mean_risk = (5 - mean_score) / 4.0  # 0~1
+        return self.alpha * normalized_mean_risk + self.beta * low_score_ratio
 
     def refresh_need_opt(self):
         stats = {}
@@ -245,8 +256,8 @@ class AgentEvalManager:
             # Calculate metrics
             mean_score = sum(buffer.scores) / buffer.total_sample_nums
             low_score_ratio = sum(1 for s in buffer.scores if s <= 2) / buffer.total_sample_nums
-            normalized_mean_risk = (5 - mean_score) / 4.0  # 0~1
-            risk = self.alpha * normalized_mean_risk + self.beta * low_score_ratio
+            risk = self.compute_risk(agent_id)
+            self.agent_risks[agent_id] = risk
             if buffer.category_stats:
                 most_common_count = max(
                     info["count"] for info in buffer.category_stats.values()
@@ -279,6 +290,7 @@ class AgentEvalManager:
         if agent_id not in self.agent_evals:
             self.agent_evals[agent_id] = AgentEvalBuffer()
             self.need_opt.setdefault(agent_id, False)
+            self.agent_risks.setdefault(agent_id, 0.0)
         return self.agent_evals[agent_id]
 
     def to_dict(self):
@@ -288,6 +300,7 @@ class AgentEvalManager:
                 for agent_id, eval_buffer in self.agent_evals.items()
             },
             "need_opt": dict(self.need_opt),
+            "agent_risks": dict(self.agent_risks),
             "optimize_top_k": self.optimize_top_k,
             "alpha": self.alpha,
             "beta": self.beta,
@@ -297,6 +310,7 @@ class AgentEvalManager:
     def from_dict(cls, payload):
         obj = cls()
         obj.need_opt = dict(payload.get("need_opt", {}))
+        obj.agent_risks = {k: float(v) for k, v in payload.get("agent_risks", {}).items()}
         obj.optimize_top_k = int(payload.get("optimize_top_k", 2))
         obj.alpha = float(payload.get("alpha", 0.6))
         obj.beta = float(payload.get("beta", 0.4))

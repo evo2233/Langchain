@@ -235,7 +235,46 @@ def load_training_snapshot(snapshot_path: Path):
     }
 
 
-def train_workflow(llm, trainset, max_epochs=3, snapshot_path: Path = None, resume: bool = False):
+def _build_validation_subset(test_set):
+    subset_size = int(len(test_set) * 0.2)
+    return test_set[:subset_size]
+
+
+def _run_prompt_update_validation(
+    llm,
+    validation_set,
+    agent_prompts_for_validation: Dict[str, str],
+    agg_prompts_for_validation: List[str],
+    epoch_agent_evals: AgentEvalManager,
+    epoch_agg_evals: AggEvalManager,
+    trigger_source: str,
+):
+    if not validation_set:
+        logging.info('[PROMPT_UPDATE_VALIDATION] skipped because validation set is empty.')
+        return
+
+    accuracy = test_workflow(llm, validation_set, agent_prompts_for_validation, agg_prompts_for_validation)
+
+    credit_payload = {
+        'trigger_source': trigger_source,
+        'validation_accuracy': accuracy,
+    }
+
+    if trigger_source.startswith('agent_'):
+        credit_payload['agent_risk'] = {
+            trigger_source: epoch_agent_evals.agent_risks.get(trigger_source, 0.0)
+        }
+    elif trigger_source.startswith('aggregator_round_'):
+        agg_idx = int(trigger_source.split('_')[-1]) - 1
+        if 0 <= agg_idx < len(epoch_agg_evals.agg_credits):
+            credit_payload['aggregator_new_credit'] = {
+                f'agg_{agg_idx + 1}': epoch_agg_evals.agg_credits[agg_idx]
+            }
+
+    logging.info('[PROMPT_UPDATE_VALIDATION] %s', json.dumps(credit_payload, ensure_ascii=False))
+
+
+def train_workflow(llm, train_set, validation_set, max_epochs=3, snapshot_path: Path = None, resume: bool = False):
     global_prompts = AGENT_ORIGIN_PROMPTS
     agg_prompts = [AGG_ORIGIN_PROMPT] * 3
 
@@ -264,15 +303,15 @@ def train_workflow(llm, trainset, max_epochs=3, snapshot_path: Path = None, resu
         if resume and epoch == start_epoch:
             epoch_agent_evals = snapshot["epoch_agent_evals"]
             epoch_agg_evals = snapshot["epoch_agg_evals"]
-            example_range = range(start_example_idx, len(trainset))
+            example_range = range(start_example_idx, len(train_set))
         else:
             epoch_agent_evals = AgentEvalManager()
             epoch_agg_evals = AggEvalManager()
-            example_range = range(len(trainset))
+            example_range = range(len(train_set))
 
         for i in example_range:
-            ex = trainset[i]
-            logging.info(f"--- Training Example {i + 1}/{len(trainset)} ---")
+            ex = train_set[i]
+            logging.info(f"--- Training Example {i + 1}/{len(train_set)} ---")
 
             # 挂载单题的初始状态
             state: DebateState = {
@@ -316,7 +355,19 @@ def train_workflow(llm, trainset, max_epochs=3, snapshot_path: Path = None, resu
                     logging.info("Aggregator performance is poor. Triggering Temporal Optimization...")
                     agg_opt_app = build_agg_opt_graph(llm, agg_idx)
 
+                    old_agg_prompts = list(agg_prompts)
                     state = agg_opt_app.invoke(state)
+
+                    _run_prompt_update_validation(
+                        llm,
+                        validation_set,
+                        global_prompts,
+                        old_agg_prompts,
+                        epoch_agent_evals,
+                        epoch_agg_evals,
+                        trigger_source=f"aggregator_round_{agg_idx + 1}",
+                    )
+
                     # 更新全局变量
                     agg_prompts = state["agg_prompts"]
                     epoch_agg_evals.agg_error_buffers[agg_idx] = []
@@ -330,7 +381,7 @@ def train_workflow(llm, trainset, max_epochs=3, snapshot_path: Path = None, resu
             if snapshot_path is not None:
                 next_example_idx = i + 1
                 next_epoch = epoch
-                if next_example_idx >= len(trainset):
+                if next_example_idx >= len(train_set):
                     next_example_idx = 0
                     next_epoch = epoch + 1
                 save_training_snapshot(
@@ -361,7 +412,18 @@ def train_workflow(llm, trainset, max_epochs=3, snapshot_path: Path = None, resu
                     "agent_prompts": global_prompts.copy(),
                     "agg_evaluations": epoch_agg_evals, "agg_error_diagnosis": "", "agg_prompts": agg_prompts
                 }
+                old_agent_prompts = global_prompts.copy()
                 opt_state = agent_opt_app.invoke(opt_state)
+
+                _run_prompt_update_validation(
+                    llm,
+                    validation_set,
+                    old_agent_prompts,
+                    agg_prompts,
+                    epoch_agent_evals,
+                    epoch_agg_evals,
+                    trigger_source=agent_id,
+                )
 
                 # 应用更新
                 global_prompts[agent_id] = opt_state["agent_prompts"][agent_id]
@@ -371,13 +433,13 @@ def train_workflow(llm, trainset, max_epochs=3, snapshot_path: Path = None, resu
     return global_prompts, agg_prompts
 
 
-def test_workflow(llm, testset, agent_prompts: Dict[str, str], agg_prompts: List[str]) -> float:
+def test_workflow(llm, test_set, agent_prompts: Dict[str, str], agg_prompts: List[str]) -> float:
     """仅执行辩论与汇总，在测试集上统计准确率。"""
     test_app = build_test_graph(llm, agent_prompts, agg_prompts)
 
     correct = 0
-    total = len(testset)
-    for i, ex in enumerate(testset):
+    total = len(test_set)
+    for i, ex in enumerate(test_set):
         logging.info("--- Testing Example %s/%s ---", i + 1, total)
         state: DebateState = {
             "question": ex["question"],
@@ -454,11 +516,15 @@ if __name__ == '__main__':
 
     if args.mode == "train":
         configure_logging(f"debate_{args.dataset}_train_log")
-        trainset = load_json_for_langgraph(path=str(train_path))
+        train_set = load_json_for_langgraph(path=str(train_path))
+        test_set = load_json_for_langgraph(path=str(test_path))
+        validation_set = _build_validation_subset(test_set)
+        logging.info("Validation set prepared from test set head 20%%: %s/%s", len(validation_set), len(test_set))
         snapshot_path = Path(f"./result/debate_{args.dataset}_train_snapshot.json")
         final_agent_prompts, final_agg_prompts = train_workflow(
             llm,
-            trainset,
+            train_set,
+            validation_set=validation_set,
             max_epochs=args.epochs,
             snapshot_path=snapshot_path,
             resume=args.resume,
@@ -472,10 +538,10 @@ if __name__ == '__main__':
             print(f"{k}:\n{v}\n")
     else:
         configure_logging(f"debate_{args.dataset}_test_log")
-        testset = load_json_for_langgraph(path=str(test_path))
+        test_set = load_json_for_langgraph(path=str(test_path))
         if args.no_opt:
             final_agent_prompts = AGENT_ORIGIN_PROMPTS
             final_agg_prompts = [AGG_ORIGIN_PROMPT] * 3
         else:
             final_agent_prompts, final_agg_prompts = load_optimized_prompts(prompt_path)
-        test_workflow(llm, testset, final_agent_prompts, final_agg_prompts)
+        test_workflow(llm, test_set, final_agent_prompts, final_agg_prompts)
