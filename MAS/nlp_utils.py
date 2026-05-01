@@ -13,7 +13,7 @@ class ExtractOptionOutput(BaseModel):
 
 
 def _build_default_llm():
-    api_base = os.getenv("VLLM_API_BASE", "http://127.0.0.1:8085/v1")
+    api_base = os.getenv("VLLM_API_BASE", "http://127.0.0.1:8086/v1")
     api_key = os.getenv("VLLM_API_KEY", "vllm")
     return ChatOpenAI(
         model="/model",

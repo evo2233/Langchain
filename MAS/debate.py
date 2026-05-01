@@ -17,6 +17,9 @@ from node import (
     load_json_for_langgraph
 )
 
+EVAL_BASE_PROMPT = "You are an expert evaluator. Please complete the task according to the requirements below."
+OPT_BASE_PROMPT = "You are an expert prompt optimizer. Please provide prompts that match the rule below."
+
 
 def configure_logging(log_name: str = "training_log.txt") -> Path:
     log_path = Path(__file__).resolve().parent / log_name
@@ -39,28 +42,26 @@ def configure_logging(log_name: str = "training_log.txt") -> Path:
     return log_path
 
 
-VLLM_API_BASE = os.getenv("VLLM_API_BASE", "http://127.0.0.1:8085/v1")
-VLLM_API_KEY = os.getenv("VLLM_API_KEY", "vllm")
+def load_llm(gpu_id: int):
+    VLLM_API_BASE = os.getenv(f"VLLM_API_BASE", f"http://127.0.0.1:808{gpu_id}/v1")
+    VLLM_API_KEY = os.getenv("VLLM_API_KEY", "vllm")
 
-llm = ChatOpenAI(
-    model="/model",
-    api_key=VLLM_API_KEY,
-    base_url=VLLM_API_BASE,
-    max_tokens=4096,
-    temperature=0.3,
-    top_p=0.9,
-    extra_body={"repetition_penalty": 1.2}
-)
-
-EVAL_BASE_PROMPT = "You are an expert evaluator. Please complete the task according to the requirements below."
-OPT_BASE_PROMPT = "You are an expert prompt optimizer. Please provide prompts that match the rule below."
+    return ChatOpenAI(
+        model="/model",
+        api_key=VLLM_API_KEY,
+        base_url=VLLM_API_BASE,
+        max_tokens=4096,
+        temperature=0.3,
+        top_p=0.9,
+        extra_body={"repetition_penalty": 1.2}
+    )
 
 
 # ==========================================
 # 1. 图构建工厂 (Graphs Factories)
 # ==========================================
 
-def build_forward_eval_graph(agent_prompts: dict, agg_prompts: list):
+def build_forward_eval_graph(llm, agent_prompts: Dict[str, str], agg_prompts: List[str]):
     """构建包含【3轮前向辩论】和【结果评估】的执行图"""
     workflow = StateGraph(DebateState)
 
@@ -119,7 +120,7 @@ def build_forward_eval_graph(agent_prompts: dict, agg_prompts: list):
     return workflow.compile()
 
 
-def build_test_graph(agent_prompts: Dict[str, str], agg_prompts: List[str]):
+def build_test_graph(llm, agent_prompts: Dict[str, str], agg_prompts: List[str]):
     """构建只包含【3轮辩论 + 汇总】的测试图，不包含评估与优化节点。"""
     workflow = StateGraph(DebateState)
 
@@ -157,7 +158,7 @@ def build_test_graph(agent_prompts: Dict[str, str], agg_prompts: List[str]):
     return workflow.compile()
 
 
-def build_agent_opt_graph(agent_id: str):
+def build_agent_opt_graph(llm, agent_id: str):
     """构建 Agent 结构优化图 (诊断 -> 优化)"""
     workflow = StateGraph(DebateState)
     workflow.add_node("diag", create_agent_error_diagnosis_node(agent_id, llm, EVAL_BASE_PROMPT))
@@ -169,7 +170,7 @@ def build_agent_opt_graph(agent_id: str):
     return workflow.compile()
 
 
-def build_agg_opt_graph(agg_idx: int):
+def build_agg_opt_graph(llm, agg_idx: int):
     """构建 Aggregator 时间优化图 (诊断 -> 优化)"""
     workflow = StateGraph(DebateState)
     workflow.add_node("diag", create_agg_error_diagnosis_node(agg_idx, llm, EVAL_BASE_PROMPT))
@@ -221,7 +222,7 @@ def load_training_snapshot(snapshot_path: Path):
     }
 
 
-def train_workflow(trainset, max_epochs=3, snapshot_path: Path = None, resume: bool = False):
+def train_workflow(llm, trainset, max_epochs=3, snapshot_path: Path = None, resume: bool = False):
     # 1. 初始提示词配置
     global_prompts = {
         "agent_1": "You are an economist. Consider the following problem from an economic perspective.",
@@ -251,7 +252,7 @@ def train_workflow(trainset, max_epochs=3, snapshot_path: Path = None, resume: b
         logging.info(f"\n========== Epoch {epoch + 1}/{max_epochs} ==========")
 
         # 每轮 Epoch 开始，用最新 Prompts 重新编译【前向图】，避免静态 Prompt 写死在 Node 闭包中
-        forward_app = build_forward_eval_graph(global_prompts, agg_prompts)
+        forward_app = build_forward_eval_graph(llm, global_prompts, agg_prompts)
 
         # 初始化当前 Epoch 的评估缓存
         if resume and epoch == start_epoch:
@@ -307,7 +308,7 @@ def train_workflow(trainset, max_epochs=3, snapshot_path: Path = None, resume: b
             for agg_idx, _ in enumerate(agg_prompts):
                 if epoch_agg_evals.need_opt[agg_idx]:
                     logging.info("Aggregator performance is poor. Triggering Temporal Optimization...")
-                    agg_opt_app = build_agg_opt_graph(agg_idx)
+                    agg_opt_app = build_agg_opt_graph(llm, agg_idx)
 
                     state = agg_opt_app.invoke(state)
                     # 更新全局变量
@@ -318,7 +319,7 @@ def train_workflow(trainset, max_epochs=3, snapshot_path: Path = None, resume: b
                     logging.info(f"[Updated Aggregator Prompt]:\n{agg_prompts[agg_idx]}\n")
 
                     # 使新的 Aggregator Prompt 立即在下一道题生效
-                    forward_app = build_forward_eval_graph(global_prompts, agg_prompts)
+                    forward_app = build_forward_eval_graph(llm, global_prompts, agg_prompts)
 
             if snapshot_path is not None:
                 next_example_idx = i + 1
@@ -345,7 +346,7 @@ def train_workflow(trainset, max_epochs=3, snapshot_path: Path = None, resume: b
         for agent_id in ["agent_1", "agent_2", "agent_3"]:
             if epoch_agent_evals.need_opt.get(agent_id, False):
                 logging.info(f"Agent [{agent_id}]. Optimizing...")
-                agent_opt_app = build_agent_opt_graph(agent_id)
+                agent_opt_app = build_agent_opt_graph(llm, agent_id)
 
                 opt_state: DebateState = {
                     "question": "", "correct_answer": "", "responses": {}, "final_answer": "",
@@ -364,9 +365,9 @@ def train_workflow(trainset, max_epochs=3, snapshot_path: Path = None, resume: b
     return global_prompts, agg_prompts
 
 
-def test_workflow(testset, agent_prompts: Dict[str, str], agg_prompts: List[str]) -> float:
+def test_workflow(llm, testset, agent_prompts: Dict[str, str], agg_prompts: List[str]) -> float:
     """仅执行辩论与汇总，在测试集上统计准确率。"""
-    test_app = build_test_graph(agent_prompts, agg_prompts)
+    test_app = build_test_graph(llm, agent_prompts, agg_prompts)
 
     correct = 0
     total = len(testset)
@@ -386,7 +387,7 @@ def test_workflow(testset, agent_prompts: Dict[str, str], agg_prompts: List[str]
         }
 
         state = test_app.invoke(state)
-        pred_option = extract_option(state["final_answer"], llm=llm)
+        pred_option = extract_option(state["final_answer"])
         is_correct = pred_option == ex["correct_answer"]
         correct += int(is_correct)
 
@@ -434,12 +435,14 @@ def load_optimized_prompts(path: Path) -> Tuple[Dict[str, str], List[str]]:
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Train/Test MAS debate workflow.")
     parser.add_argument("--mode", choices=["train", "test"], default="test")
+    parser.add_argument("--gpu_id", type=int, default=5)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--dataset", type=str, default="MedMCQA")
     parser.add_argument("--resume", action="store_true", help="Resume train mode from snapshot.")
     parser.add_argument("--snapshot-path", type=str, default=None, help="Path to training snapshot json.")
     args = parser.parse_args()
 
+    llm = load_llm(args.gpu_id)
     prompt_path = Path(f"./result/debate_{args.dataset}_optimized_prompts.json")
     train_path, test_path = resolve_dataset_paths(args.dataset)
 
@@ -448,6 +451,7 @@ if __name__ == '__main__':
         trainset = load_json_for_langgraph(path=str(train_path))
         snapshot_path = Path(args.snapshot_path) if args.snapshot_path else Path(f"./result/debate_{args.dataset}_train_snapshot.json")
         final_agent_prompts, final_agg_prompts = train_workflow(
+            llm,
             trainset,
             max_epochs=args.epochs,
             snapshot_path=snapshot_path,
@@ -464,4 +468,4 @@ if __name__ == '__main__':
         configure_logging(f"debate_{args.dataset}_test_log.txt")
         testset = load_json_for_langgraph(path=str(test_path))
         final_agent_prompts, final_agg_prompts = load_optimized_prompts(prompt_path)
-        test_workflow(testset, final_agent_prompts, final_agg_prompts)
+        test_workflow(llm, testset, final_agent_prompts, final_agg_prompts)
