@@ -15,6 +15,8 @@ Usage:
   run.sh --start   # train + test
   run.sh --resume  # resume train + test
   run.sh --noopt   # test only with --no_opt
+  run.sh --temporal # train (Temporal Optimization only) + test
+  run.sh --spatial  # train (Spatial Optimization only) + test
 USAGE
 }
 
@@ -25,7 +27,7 @@ fi
 
 MODE="$1"
 case "${MODE}" in
-  --start|--resume|--noopt)
+  --start|--resume|--noopt|--temporal|--spatial)
     ;;
   *)
     usage
@@ -76,6 +78,34 @@ for DATASET in "${DATASETS[@]}"; do
       --gpu_id "${GPU_ID}" \
       --epochs "${EPOCHS}" \
       --dataset "${DATASET}"
+
+    echo "[2/2] Start test workflow"
+    "${PYTHON_BIN}" "${SCRIPT_DIR}/debate.py" \
+      --mode test \
+      --gpu_id "${GPU_ID}" \
+      --dataset "${DATASET}"
+  elif [[ "${MODE}" == "--temporal" ]]; then
+    echo "[1/2] Start training workflow (Temporal Optimization only, epochs=${EPOCHS})"
+    "${PYTHON_BIN}" "${SCRIPT_DIR}/debate.py" \
+      --mode train \
+      --gpu_id "${GPU_ID}" \
+      --epochs "${EPOCHS}" \
+      --dataset "${DATASET}" \
+      --optimization_mode Temporal
+
+    echo "[2/2] Start test workflow"
+    "${PYTHON_BIN}" "${SCRIPT_DIR}/debate.py" \
+      --mode test \
+      --gpu_id "${GPU_ID}" \
+      --dataset "${DATASET}"
+  elif [[ "${MODE}" == "--spatial" ]]; then
+    echo "[1/2] Start training workflow (Spatial Optimization only, epochs=${EPOCHS})"
+    "${PYTHON_BIN}" "${SCRIPT_DIR}/debate.py" \
+      --mode train \
+      --gpu_id "${GPU_ID}" \
+      --epochs "${EPOCHS}" \
+      --dataset "${DATASET}" \
+      --optimization_mode Spatial
 
     echo "[2/2] Start test workflow"
     "${PYTHON_BIN}" "${SCRIPT_DIR}/debate.py" \
