@@ -2,6 +2,7 @@ import argparse
 import json
 import logging
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -28,8 +29,13 @@ EVAL_BASE_PROMPT = "You are an expert evaluator. Please complete the task accord
 OPT_BASE_PROMPT = "You are an expert prompt optimizer. Please provide prompts that match the rule below."
 
 
-def configure_logging(log_name: str = "training_log.txt") -> Path:
-    log_path = Path(__file__).resolve().parent / log_name
+def configure_logging(log_name: str) -> Path:
+    log_dir = Path(__file__).resolve().parent / "log"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%m%d_%H%M%S")
+    full_log_name = f"{log_name}_{timestamp}.log"
+    log_path = log_dir / full_log_name
     formatter = logging.Formatter(
         "%(asctime)s - %(levelname)s - %(name)s - %(message)s"
     )
@@ -447,7 +453,7 @@ if __name__ == '__main__':
     train_path, test_path = resolve_dataset_paths(args.dataset)
 
     if args.mode == "train":
-        configure_logging(f"debate_{args.dataset}_train_log.txt")
+        configure_logging(f"debate_{args.dataset}_train_log")
         trainset = load_json_for_langgraph(path=str(train_path))
         snapshot_path = Path(f"./result/debate_{args.dataset}_train_snapshot.json")
         final_agent_prompts, final_agg_prompts = train_workflow(
@@ -465,7 +471,7 @@ if __name__ == '__main__':
         for k, v in final_agent_prompts.items():
             print(f"{k}:\n{v}\n")
     else:
-        configure_logging(f"debate_{args.dataset}_test_log.txt")
+        configure_logging(f"debate_{args.dataset}_test_log")
         testset = load_json_for_langgraph(path=str(test_path))
         if args.no_opt:
             final_agent_prompts = AGENT_ORIGIN_PROMPTS

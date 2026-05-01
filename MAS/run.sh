@@ -5,9 +5,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 EPOCHS="${EPOCHS:-3}"
 DEFAULT_GPU_ID="${DEFAULT_GPU_ID:-6}"
-
+# 注意：本脚本适用于串行运行多个实验，为避免资源浪费请确保gpu_id一致
 DATASETS=(${DATASETS:-MMLU GPQA})
-DATASET_GPU_MAP="${DATASET_GPU_MAP:-MMLU:5 GPQA:6}"
+DATASET_GPU_MAP="${DATASET_GPU_MAP:-MMLU:5 GPQA:5}"
 
 usage() {
   cat <<'USAGE'
@@ -59,29 +59,34 @@ for DATASET in "${DATASETS[@]}"; do
     echo "[1/2] Start training workflow (epochs=${EPOCHS})"
     "${PYTHON_BIN}" "${SCRIPT_DIR}/debate.py" \
       --mode train \
+      --gpu_id "${GPU_ID}" \
       --epochs "${EPOCHS}" \
       --dataset "${DATASET}"
 
     echo "[2/2] Start test workflow"
     "${PYTHON_BIN}" "${SCRIPT_DIR}/debate.py" \
       --mode test \
+      --gpu_id "${GPU_ID}" \
       --dataset "${DATASET}"
   elif [[ "${MODE}" == "--resume" ]]; then
     echo "[1/2] Start training workflow (resume, epochs=${EPOCHS})"
     "${PYTHON_BIN}" "${SCRIPT_DIR}/debate.py" \
       --mode train \
       --resume \
+      --gpu_id "${GPU_ID}" \
       --epochs "${EPOCHS}" \
       --dataset "${DATASET}"
 
     echo "[2/2] Start test workflow"
     "${PYTHON_BIN}" "${SCRIPT_DIR}/debate.py" \
       --mode test \
+      --gpu_id "${GPU_ID}" \
       --dataset "${DATASET}"
   else
     echo "[1/1] Start no-opt test workflow"
     "${PYTHON_BIN}" "${SCRIPT_DIR}/debate.py" \
       --mode test \
+      --gpu_id "${GPU_ID}" \
       --no_opt \
       --dataset "${DATASET}"
   fi
