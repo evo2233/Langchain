@@ -544,7 +544,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     llm = load_llm(args.gpu_id)
-    prompt_path = Path(f"./result/debate_{args.dataset}_optimized_prompts.json")
+    prompt_path = Path(f"./result/debate_{args.dataset}_{args.optimization_mode}_optimized_prompts.json")
     train_path, test_path = resolve_dataset_paths(args.dataset)
 
     if args.mode == "train":
@@ -553,7 +553,7 @@ if __name__ == '__main__':
         test_set = load_json_for_langgraph(path=str(test_path))
         validation_set = _build_validation_subset(test_set)
         logging.info("Validation set prepared from test set head 20%%: %s/%s", len(validation_set), len(test_set))
-        snapshot_path = Path(f"./result/debate_{args.dataset}_train_snapshot.json")
+        snapshot_path = Path(f"./result/debate_{args.dataset}_{args.optimization_mode}_train_snapshot.json")
         final_agent_prompts, final_agg_prompts = train_workflow(
             llm,
             train_set,
