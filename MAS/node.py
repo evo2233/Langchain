@@ -48,20 +48,6 @@ def _log_invoke_exception(tag: str, exc: Exception) -> None:
     logging.error("[%s] LLM invoke exception details: %s", tag, _safe_json_dumps(detail_payload))
 
 
-def _log_llm_messages(tag: str, messages: List[tuple]) -> None:
-    logging.info("[%s] LLM input messages: %s", tag, _safe_json_dumps(messages))
-
-
-def _log_llm_output(tag: str, output_obj) -> None:
-    if hasattr(output_obj, "model_dump"):
-        output_payload = output_obj.model_dump()
-    elif hasattr(output_obj, "dict"):
-        output_payload = output_obj.dict()
-    else:
-        output_payload = output_obj
-    logging.info("[%s] LLM output: %s", tag, _safe_json_dumps(output_payload))
-
-
 def _extract_structured_response(result, tag: str):
     if isinstance(result, dict) and "parsed" in result:
         raw_obj = result.get("raw")
@@ -83,14 +69,12 @@ def _extract_structured_response(result, tag: str):
 
 
 def _invoke_with_logging(chain, messages: List[tuple], tag: str):
-    _log_llm_messages(tag, messages)
     max_retries = 2
 
     for attempt in range(max_retries + 1):
         try:
             res = chain.invoke(messages)
             parsed_res = _extract_structured_response(res, tag)
-            _log_llm_output(tag, parsed_res)
             return parsed_res
         except Exception as exc:
             _log_invoke_exception(tag, exc)

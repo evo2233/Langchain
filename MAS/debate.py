@@ -52,6 +52,12 @@ def configure_logging(log_name: str) -> Path:
 
     root_logger.addHandler(file_handler)
     root_logger.addHandler(stream_handler)
+
+    # Suppress noisy transport-level request logs from model clients.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("openai").setLevel(logging.WARNING)
+
     root_logger.info("Logging initialized. Log file: %s", log_path)
     return log_path
 
@@ -611,6 +617,12 @@ if __name__ == '__main__':
     llm = load_llm(args.gpu_id)
     prompt_path = Path(f"./result/debate_{args.dataset}_{args.optimization_mode}_optimized_prompts.json")
     train_path, test_path = resolve_dataset_paths(args.dataset)
+
+    logging.info("Config: GPU=%s, Opt=%s, Control=%s", args.gpu_id, args.optimization_mode, args.control_mode)
+    logging.info(
+        "Runtime Args: mode=%s, dataset=%s, epochs=%s, resume=%s, no_opt=%s",
+        args.mode, args.dataset, args.epochs, args.resume, args.no_opt,
+    )
 
     if args.mode == "train":
         configure_logging(f"debate_{args.dataset}_train_log")
