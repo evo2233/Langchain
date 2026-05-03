@@ -275,6 +275,62 @@ def _run_prompt_update_validation(
     logging.info('[PROMPT_UPDATE_VALIDATION] %s', json.dumps(credit_payload, ensure_ascii=False))
 
 
+def _apply_uniform_error_allocation(
+    epoch_agent_evals: AgentEvalManager,
+    epoch_agg_evals: AggEvalManager,
+) -> None:
+    """对照实验：将错误平均分配到所有 Agent 与 Aggregator 轮次。"""
+    if epoch_agent_evals.agent_evals:
+        agent_ids = list(epoch_agent_evals.agent_evals.keys())
+        merged_scores = []
+        merged_total = 0
+        merged_correct = 0
+        merged_stats = {}
+        max_examples = None
+
+        for buffer in epoch_agent_evals.agent_evals.values():
+            merged_scores.extend(buffer.scores)
+            merged_total += buffer.total_sample_nums
+            merged_correct += buffer.correct_sample_nums
+            max_examples = buffer.max_examples if max_examples is None else max(max_examples, buffer.max_examples)
+            for category, info in buffer.category_stats.items():
+                bucket = merged_stats.setdefault(category, {"count": 0, "examples": []})
+                bucket["count"] += int(info.get("count", 0))
+                bucket["examples"].extend(info.get("examples", []))
+
+        if agent_ids:
+            avg_total = merged_total // len(agent_ids)
+            avg_correct = merged_correct // len(agent_ids)
+            for category in merged_stats.values():
+                category["count"] = category["count"] // len(agent_ids)
+                if max_examples is not None:
+                    category["examples"] = category["examples"][:max_examples]
+
+            for agent_id in agent_ids:
+                buffer = epoch_agent_evals.agent_evals[agent_id]
+                buffer.scores = list(merged_scores)
+                buffer.total_sample_nums = avg_total
+                buffer.correct_sample_nums = avg_correct
+                buffer.category_stats.clear()
+                for category, info in merged_stats.items():
+                    bucket = buffer.category_stats[category]
+                    bucket["count"] = info["count"]
+                    bucket["examples"] = list(info["examples"])
+
+    if epoch_agg_evals.agg_credits:
+        avg_credit = sum(epoch_agg_evals.agg_credits) / len(epoch_agg_evals.agg_credits)
+        merged_errors = []
+        need_opt = False
+        for idx in range(len(epoch_agg_evals.agg_credits)):
+            merged_errors.extend(epoch_agg_evals.agg_error_buffers[idx])
+            need_opt = need_opt or bool(epoch_agg_evals.need_opt[idx])
+
+        for idx in range(len(epoch_agg_evals.agg_credits)):
+            epoch_agg_evals.agg_credits[idx] = avg_credit
+            epoch_agg_evals.agg_error_buffers[idx] = list(merged_errors[:20])
+            epoch_agg_evals.need_opt[idx] = need_opt
+
+
 def train_workflow(
     llm,
     train_set,
@@ -283,6 +339,7 @@ def train_workflow(
     snapshot_path: Path = None,
     resume: bool = False,
     optimization_mode: str = "Both",
+    control_mode: str = "default",
 ):
     global_prompts = AGENT_ORIGIN_PROMPTS
     agg_prompts = [AGG_ORIGIN_PROMPT] * 3
@@ -361,6 +418,8 @@ def train_workflow(
                 # 累积当前状态的 Evaluation 供后续分析
                 epoch_agent_evals = state["agent_evaluations"]
                 epoch_agg_evals = state["agg_evaluations"]
+                if control_mode == "uniform":
+                    _apply_uniform_error_allocation(epoch_agent_evals, epoch_agg_evals)
 
                 # --- B. Temporal Optimization (Aggregator 实时更新) ---
                 if run_temporal_optimization:
@@ -541,6 +600,12 @@ if __name__ == '__main__':
         default="Both",
         help="Training optimization mode: Both (default), Temporal only, or Spatial only.",
     )
+    parser.add_argument(
+        "--control_mode",
+        choices=["default", "uniform"],
+        default="default",
+        help="Error attribution mode: default or uniform (control experiment).",
+    )
     args = parser.parse_args()
 
     llm = load_llm(args.gpu_id)
@@ -562,6 +627,7 @@ if __name__ == '__main__':
             snapshot_path=snapshot_path,
             resume=args.resume,
             optimization_mode=args.optimization_mode,
+            control_mode=args.control_mode,
         )
         save_optimized_prompts(final_agent_prompts, final_agg_prompts, prompt_path)
 
