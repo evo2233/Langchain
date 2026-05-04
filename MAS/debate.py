@@ -602,14 +602,14 @@ if __name__ == '__main__':
     prompt_path = Path(f"./result/debate_{args.dataset}_{args.optimization_mode}_optimized_prompts.json")
     train_path, test_path = resolve_dataset_paths(args.dataset)
 
-    logging.info("Config: GPU=%s, Opt=%s, Control=%s", args.gpu_id, args.optimization_mode, args.control_mode)
-    logging.info(
-        "Runtime Args: mode=%s, dataset=%s, epochs=%s, resume=%s, no_opt=%s",
-        args.mode, args.dataset, args.epochs, args.resume, args.no_opt,
-    )
-
     if args.mode == "train":
         configure_logging(f"debate_{args.dataset}_train_log")
+        logging.info("Config: GPU=%s, Opt=%s, Control=%s", args.gpu_id, args.optimization_mode, args.control_mode)
+        logging.info(
+            "Runtime Args: mode=%s, dataset=%s, epochs=%s, resume=%s, no_opt=%s",
+            args.mode, args.dataset, args.epochs, args.resume, args.no_opt,
+        )
+
         train_set = load_json_for_langgraph(path=str(train_path))
         test_set = load_json_for_langgraph(path=str(test_path))
         validation_set = _build_validation_subset(test_set)
@@ -636,6 +636,12 @@ if __name__ == '__main__':
             print(f"{k}:\n{v}\n")
     else:
         configure_logging(f"debate_{args.dataset}_test_log")
+        logging.info("Config: GPU=%s, Opt=%s, Control=%s", args.gpu_id, args.optimization_mode, args.control_mode)
+        logging.info(
+            "Runtime Args: mode=%s, dataset=%s, epochs=%s, resume=%s, no_opt=%s",
+            args.mode, args.dataset, args.epochs, args.resume, args.no_opt,
+        )
+
         test_set = load_json_for_langgraph(path=str(test_path))
         if args.no_opt:
             final_agent_prompts, final_agg_prompts = resolve_agent_and_round_config(

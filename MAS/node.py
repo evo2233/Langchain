@@ -56,7 +56,7 @@ def _extract_structured_response(result, tag: str):
             "response_metadata": getattr(raw_obj, "response_metadata", {}),
             "additional_kwargs": getattr(raw_obj, "additional_kwargs", {}),
         }
-        logging.info("[%s] LLM raw output: %s", tag, _safe_json_dumps(raw_payload))
+        # logging.info("[%s] LLM raw output: %s", tag, _safe_json_dumps(raw_payload))
 
         parsing_error = result.get("parsing_error")
         if parsing_error:
