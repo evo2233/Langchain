@@ -30,6 +30,26 @@ EVAL_BASE_PROMPT = "You are an expert evaluator. Please complete the task accord
 OPT_BASE_PROMPT = "You are an expert prompt optimizer. Please provide prompts that match the rule below."
 
 
+def resolve_agent_and_round_config(
+    base_agent_prompts: Dict[str, str],
+    max_agents_per_round: int,
+    total_rounds: int,
+) -> Tuple[Dict[str, str], List[str]]:
+    if max_agents_per_round < 1 or total_rounds < 1:
+        raise ValueError("max_agents_per_round and total_rounds must be >= 1")
+
+    # 按需求使用 max(每轮最大参与数, 初始定义的智能体数)
+    target_agent_count = max(max_agents_per_round, len(base_agent_prompts))
+    resolved_agent_prompts = dict(base_agent_prompts)
+    for idx in range(len(base_agent_prompts) + 1, target_agent_count + 1):
+        resolved_agent_prompts[f"agent_{idx}"] = (
+            "You are a domain expert. Analyze the question carefully and provide concise reasoning."
+        )
+
+    agg_prompts = [AGG_ORIGIN_PROMPT] * total_rounds
+    return resolved_agent_prompts, agg_prompts
+
+
 def configure_logging(log_name: str) -> Path:
     log_dir = Path(__file__).resolve().parent / "log"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -82,98 +102,57 @@ def load_llm(gpu_id: int):
 # ==========================================
 
 def build_forward_eval_graph(llm, agent_prompts: Dict[str, str], agg_prompts: List[str]):
-    """构建包含【3轮前向辩论】和【结果评估】的执行图"""
+    """构建包含【多轮前向辩论】和【结果评估】的执行图"""
     workflow = StateGraph(DebateState)
+    agent_ids = sorted(agent_prompts.keys(), key=lambda x: int(x.split("_")[-1]))
+    rounds = len(agg_prompts)
+    for r in range(1, rounds + 1):
+        for i, agent_id in enumerate(agent_ids, start=1):
+            workflow.add_node(f"r{r}_d{i}", create_debate_node(agent_id, llm, agent_prompts[agent_id]))
+        workflow.add_node(f"r{r}_agg", create_aggregator_node(llm, agg_prompts[r - 1]))
+        workflow.add_node(f"r{r}_agg_eval", create_agg_eval_node(r - 1, llm, EVAL_BASE_PROMPT))
 
-    # --- 节点定义 ---
-    # Round 1
-    workflow.add_node("r1_d1", create_debate_node("agent_1", llm, agent_prompts["agent_1"]))
-    workflow.add_node("r1_d2", create_debate_node("agent_2", llm, agent_prompts["agent_2"]))
-    workflow.add_node("r1_d3", create_debate_node("agent_3", llm, agent_prompts["agent_3"]))
-    workflow.add_node("r1_agg", create_aggregator_node(llm, agg_prompts[0]))
-    workflow.add_node("r1_agg_eval", create_agg_eval_node(0, llm, EVAL_BASE_PROMPT))
+    eval_nodes = []
+    for i, agent_id in enumerate(agent_ids, start=1):
+        node_name = f"agent{i}_eval"
+        workflow.add_node(node_name, create_agent_eval_node(agent_id, llm, EVAL_BASE_PROMPT))
+        eval_nodes.append(node_name)
 
-    # Round 2
-    workflow.add_node("r2_d1", create_debate_node("agent_1", llm, agent_prompts["agent_1"]))
-    workflow.add_node("r2_d2", create_debate_node("agent_2", llm, agent_prompts["agent_2"]))
-    workflow.add_node("r2_d3", create_debate_node("agent_3", llm, agent_prompts["agent_3"]))
-    workflow.add_node("r2_agg", create_aggregator_node(llm, agg_prompts[1]))
-    workflow.add_node("r2_agg_eval", create_agg_eval_node(1, llm, EVAL_BASE_PROMPT))
-
-    # Round 3
-    workflow.add_node("r3_d1", create_debate_node("agent_1", llm, agent_prompts["agent_1"]))
-    workflow.add_node("r3_d2", create_debate_node("agent_2", llm, agent_prompts["agent_2"]))
-    workflow.add_node("r3_d3", create_debate_node("agent_3", llm, agent_prompts["agent_3"]))
-    workflow.add_node("r3_agg", create_aggregator_node(llm, agg_prompts[2]))
-    workflow.add_node("r3_agg_eval", create_agg_eval_node(2, llm, EVAL_BASE_PROMPT))
-
-    # Agent 终局评估
-    workflow.add_node("agent1_eval", create_agent_eval_node("agent_1", llm, EVAL_BASE_PROMPT))
-    workflow.add_node("agent2_eval", create_agent_eval_node("agent_2", llm, EVAL_BASE_PROMPT))
-    workflow.add_node("agent3_eval", create_agent_eval_node("agent_3", llm, EVAL_BASE_PROMPT))
-
-    # --- 边连接 ---
     workflow.set_entry_point("r1_d1")
-    workflow.add_edge("r1_d1", "r1_d2")
-    workflow.add_edge("r1_d2", "r1_d3")
-    workflow.add_edge("r1_d3", "r1_agg")
-    workflow.add_edge("r1_agg", "r1_agg_eval")
+    for r in range(1, rounds + 1):
+        for i in range(1, len(agent_ids)):
+            workflow.add_edge(f"r{r}_d{i}", f"r{r}_d{i+1}")
+        workflow.add_edge(f"r{r}_d{len(agent_ids)}", f"r{r}_agg")
+        workflow.add_edge(f"r{r}_agg", f"r{r}_agg_eval")
+        if r < rounds:
+            workflow.add_edge(f"r{r}_agg_eval", f"r{r+1}_d1")
 
-    workflow.add_edge("r1_agg_eval", "r2_d1")
-    workflow.add_edge("r2_d1", "r2_d2")
-    workflow.add_edge("r2_d2", "r2_d3")
-    workflow.add_edge("r2_d3", "r2_agg")
-    workflow.add_edge("r2_agg", "r2_agg_eval")
-
-    workflow.add_edge("r2_agg_eval", "r3_d1")
-    workflow.add_edge("r3_d1", "r3_d2")
-    workflow.add_edge("r3_d2", "r3_d3")
-    workflow.add_edge("r3_d3", "r3_agg")
-    workflow.add_edge("r3_agg", "r3_agg_eval")
-
-    # 3轮汇总完毕后，对各个 Agent 进行打分和错误归因收集
-    workflow.add_edge("r3_agg_eval", "agent1_eval")
-    workflow.add_edge("agent1_eval", "agent2_eval")
-    workflow.add_edge("agent2_eval", "agent3_eval")
-    workflow.add_edge("agent3_eval", END)
+    workflow.add_edge(f"r{rounds}_agg_eval", eval_nodes[0])
+    for i in range(len(eval_nodes) - 1):
+        workflow.add_edge(eval_nodes[i], eval_nodes[i + 1])
+    workflow.add_edge(eval_nodes[-1], END)
 
     return workflow.compile()
 
 
 def build_test_graph(llm, agent_prompts: Dict[str, str], agg_prompts: List[str]):
-    """构建只包含【3轮辩论 + 汇总】的测试图，不包含评估与优化节点。"""
+    """构建只包含【多轮辩论 + 汇总】的测试图，不包含评估与优化节点。"""
     workflow = StateGraph(DebateState)
-
-    workflow.add_node("r1_d1", create_debate_node("agent_1", llm, agent_prompts["agent_1"]))
-    workflow.add_node("r1_d2", create_debate_node("agent_2", llm, agent_prompts["agent_2"]))
-    workflow.add_node("r1_d3", create_debate_node("agent_3", llm, agent_prompts["agent_3"]))
-    workflow.add_node("r1_agg", create_aggregator_node(llm, agg_prompts[0]))
-
-    workflow.add_node("r2_d1", create_debate_node("agent_1", llm, agent_prompts["agent_1"]))
-    workflow.add_node("r2_d2", create_debate_node("agent_2", llm, agent_prompts["agent_2"]))
-    workflow.add_node("r2_d3", create_debate_node("agent_3", llm, agent_prompts["agent_3"]))
-    workflow.add_node("r2_agg", create_aggregator_node(llm, agg_prompts[1]))
-
-    workflow.add_node("r3_d1", create_debate_node("agent_1", llm, agent_prompts["agent_1"]))
-    workflow.add_node("r3_d2", create_debate_node("agent_2", llm, agent_prompts["agent_2"]))
-    workflow.add_node("r3_d3", create_debate_node("agent_3", llm, agent_prompts["agent_3"]))
-    workflow.add_node("r3_agg", create_aggregator_node(llm, agg_prompts[2]))
+    agent_ids = sorted(agent_prompts.keys(), key=lambda x: int(x.split("_")[-1]))
+    rounds = len(agg_prompts)
+    for r in range(1, rounds + 1):
+        for i, agent_id in enumerate(agent_ids, start=1):
+            workflow.add_node(f"r{r}_d{i}", create_debate_node(agent_id, llm, agent_prompts[agent_id]))
+        workflow.add_node(f"r{r}_agg", create_aggregator_node(llm, agg_prompts[r - 1]))
 
     workflow.set_entry_point("r1_d1")
-    workflow.add_edge("r1_d1", "r1_d2")
-    workflow.add_edge("r1_d2", "r1_d3")
-    workflow.add_edge("r1_d3", "r1_agg")
-
-    workflow.add_edge("r1_agg", "r2_d1")
-    workflow.add_edge("r2_d1", "r2_d2")
-    workflow.add_edge("r2_d2", "r2_d3")
-    workflow.add_edge("r2_d3", "r2_agg")
-
-    workflow.add_edge("r2_agg", "r3_d1")
-    workflow.add_edge("r3_d1", "r3_d2")
-    workflow.add_edge("r3_d2", "r3_d3")
-    workflow.add_edge("r3_d3", "r3_agg")
-    workflow.add_edge("r3_agg", END)
+    for r in range(1, rounds + 1):
+        for i in range(1, len(agent_ids)):
+            workflow.add_edge(f"r{r}_d{i}", f"r{r}_d{i+1}")
+        workflow.add_edge(f"r{r}_d{len(agent_ids)}", f"r{r}_agg")
+        if r < rounds:
+            workflow.add_edge(f"r{r}_agg", f"r{r+1}_d1")
+    workflow.add_edge(f"r{rounds}_agg", END)
 
     return workflow.compile()
 
@@ -346,9 +325,12 @@ def train_workflow(
     resume: bool = False,
     optimization_mode: str = "Both",
     control_mode: str = "default",
+    max_agents_per_round: int = 3,
+    total_rounds: int = 3,
 ):
-    global_prompts = AGENT_ORIGIN_PROMPTS
-    agg_prompts = [AGG_ORIGIN_PROMPT] * 3
+    global_prompts, agg_prompts = resolve_agent_and_round_config(
+        AGENT_ORIGIN_PROMPTS, max_agents_per_round, total_rounds
+    )
 
     start_epoch = 0
     start_example_idx = 0
@@ -393,7 +375,7 @@ def train_workflow(
                 state: DebateState = {
                     "question": ex["question"],
                     "correct_answer": ex["correct_answer"],
-                    "responses": {"agent_1": {}, "agent_2": {}, "agent_3": {}},
+                    "responses": {agent_id: {} for agent_id in global_prompts.keys()},
                     "final_answer": "",
                     "agent_evaluations": epoch_agent_evals,
                     "agent_error_summaries": {},
@@ -481,7 +463,7 @@ def train_workflow(
                 logging.info("\nEnd of Epoch. Triggering Spatial Optimization for Agents...")
 
                 epoch_agent_evals.refresh_need_opt()
-                for agent_id in ["agent_1", "agent_2", "agent_3"]:
+                for agent_id in global_prompts.keys():
                     if epoch_agent_evals.need_opt.get(agent_id, False):
                         logging.info(f"Agent [{agent_id}]. Optimizing...")
                         agent_opt_app = build_agent_opt_graph(llm, agent_id)
@@ -536,7 +518,7 @@ def test_workflow(llm, test_set, agent_prompts: Dict[str, str], agg_prompts: Lis
         state: DebateState = {
             "question": ex["question"],
             "correct_answer": ex["correct_answer"],
-            "responses": {"agent_1": {}, "agent_2": {}, "agent_3": {}},
+            "responses": {agent_id: {} for agent_id in agent_prompts.keys()},
             "final_answer": "",
             "agent_evaluations": AgentEvalManager(),
             "agent_error_summaries": {},
@@ -586,7 +568,7 @@ def load_optimized_prompts(path: Path) -> Tuple[Dict[str, str], List[str]]:
 
     agent_prompts = payload.get("agent_prompts", {})
     agg_prompts = payload.get("agg_prompts", [])
-    if not isinstance(agent_prompts, dict) or not isinstance(agg_prompts, list) or len(agg_prompts) < 3:
+    if not isinstance(agent_prompts, dict) or not isinstance(agg_prompts, list) or len(agg_prompts) < 1:
         raise ValueError(f"Invalid prompt file format: {path}")
 
     return agent_prompts, agg_prompts
@@ -600,6 +582,8 @@ if __name__ == '__main__':
     parser.add_argument("--gpu_id", type=int, default=5)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--dataset", type=str, default="MedMCQA")
+    parser.add_argument("--max_agents_per_round", type=int, default=3)
+    parser.add_argument("--total_rounds", type=int, default=3)
     parser.add_argument(
         "--optimization_mode",
         choices=["Both", "Temporal", "Spatial"],
@@ -618,14 +602,14 @@ if __name__ == '__main__':
     prompt_path = Path(f"./result/debate_{args.dataset}_{args.optimization_mode}_optimized_prompts.json")
     train_path, test_path = resolve_dataset_paths(args.dataset)
 
-    logging.info("Config: GPU=%s, Opt=%s, Control=%s", args.gpu_id, args.optimization_mode, args.control_mode)
-    logging.info(
-        "Runtime Args: mode=%s, dataset=%s, epochs=%s, resume=%s, no_opt=%s",
-        args.mode, args.dataset, args.epochs, args.resume, args.no_opt,
-    )
-
     if args.mode == "train":
         configure_logging(f"debate_{args.dataset}_train_log")
+        logging.info("Config: GPU=%s, Opt=%s, Control=%s", args.gpu_id, args.optimization_mode, args.control_mode)
+        logging.info(
+            "Runtime Args: mode=%s, dataset=%s, epochs=%s, resume=%s, no_opt=%s",
+            args.mode, args.dataset, args.epochs, args.resume, args.no_opt,
+        )
+
         train_set = load_json_for_langgraph(path=str(train_path))
         test_set = load_json_for_langgraph(path=str(test_path))
         validation_set = _build_validation_subset(test_set)
@@ -640,6 +624,8 @@ if __name__ == '__main__':
             resume=args.resume,
             optimization_mode=args.optimization_mode,
             control_mode=args.control_mode,
+            max_agents_per_round=args.max_agents_per_round,
+            total_rounds=args.total_rounds,
         )
         save_optimized_prompts(final_agent_prompts, final_agg_prompts, prompt_path)
 
@@ -650,10 +636,17 @@ if __name__ == '__main__':
             print(f"{k}:\n{v}\n")
     else:
         configure_logging(f"debate_{args.dataset}_test_log")
+        logging.info("Config: GPU=%s, Opt=%s, Control=%s", args.gpu_id, args.optimization_mode, args.control_mode)
+        logging.info(
+            "Runtime Args: mode=%s, dataset=%s, epochs=%s, resume=%s, no_opt=%s",
+            args.mode, args.dataset, args.epochs, args.resume, args.no_opt,
+        )
+
         test_set = load_json_for_langgraph(path=str(test_path))
         if args.no_opt:
-            final_agent_prompts = AGENT_ORIGIN_PROMPTS
-            final_agg_prompts = [AGG_ORIGIN_PROMPT] * 3
+            final_agent_prompts, final_agg_prompts = resolve_agent_and_round_config(
+                AGENT_ORIGIN_PROMPTS, args.max_agents_per_round, args.total_rounds
+            )
         else:
             final_agent_prompts, final_agg_prompts = load_optimized_prompts(prompt_path)
         test_workflow(llm, test_set, final_agent_prompts, final_agg_prompts)
