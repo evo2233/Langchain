@@ -400,6 +400,14 @@ def train_workflow(
                             epoch_agg_evals=epoch_agg_evals,
                         )
                     logging.exception("Training interrupted at epoch=%s, example=%s", epoch + 1, i + 1)
+                    logging.info(
+                        "Token usage at interruption: prompt_tokens=%s completion_tokens=%s total_tokens=%s successful_requests=%s total_cost=%s",
+                        cb.prompt_tokens,
+                        cb.completion_tokens,
+                        cb.total_tokens,
+                        cb.successful_requests,
+                        cb.total_cost,
+                    )
                     raise
                 logging.info(f"Question completed. Final Aggregated Answer: {state['final_answer'][:50]}...")
 
