@@ -90,7 +90,7 @@ def load_llm(gpu_id: int):
         model="/model",
         api_key=VLLM_API_KEY,
         base_url=VLLM_API_BASE,
-        max_tokens=4096,
+        max_tokens=1024,
         temperature=0.3,
         top_p=0.9,
         extra_body={"repetition_penalty": 1.2}
@@ -400,6 +400,14 @@ def train_workflow(
                             epoch_agg_evals=epoch_agg_evals,
                         )
                     logging.exception("Training interrupted at epoch=%s, example=%s", epoch + 1, i + 1)
+                    logging.info(
+                        "Token usage at interruption: prompt_tokens=%s completion_tokens=%s total_tokens=%s successful_requests=%s total_cost=%s",
+                        cb.prompt_tokens,
+                        cb.completion_tokens,
+                        cb.total_tokens,
+                        cb.successful_requests,
+                        cb.total_cost,
+                    )
                     raise
                 logging.info(f"Question completed. Final Aggregated Answer: {state['final_answer'][:50]}...")
 

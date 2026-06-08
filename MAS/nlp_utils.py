@@ -1,5 +1,6 @@
 import os
 import logging
+import re
 from typing import Optional, Literal
 
 from pydantic import BaseModel, Field
@@ -30,6 +31,26 @@ def extract_option(answer_text: str, llm: Optional[ChatOpenAI] = None) -> str:
     """
     if not isinstance(answer_text, str) or not answer_text.strip():
         raise ValueError("answer_text must be a non-empty string.")
+    
+    normalized = answer_text.strip()
+
+    # Fast deterministic path: prefer explicit option patterns from text.
+    pattern_order = [
+        r"(?i)final\s*answer\s*[:：]\s*\(?\s*([A-F])\s*\)?",
+        r"(?i)answer\s*[:：]\s*\(?\s*([A-F])\s*\)?",
+        r"(?i)option\s*[:：]\s*\(?\s*([A-F])\s*\)?",
+        r"(?i)^\s*\(?\s*([A-F])\s*\)?\s*$",
+    ]
+    for pattern in pattern_order:
+        matches = re.findall(pattern, normalized)
+        if matches:
+            return matches[-1].upper()
+
+    # Fallback: if isolated option letters appear, use the last one.
+    isolated = re.findall(r"(?<![A-Z])([A-F])(?![A-Z])", normalized.upper())
+    if isolated:
+        return isolated[-1]
+
 
     llm_client = llm if llm is not None else _build_default_llm()
     chain = llm_client.with_structured_output(ExtractOptionOutput)
