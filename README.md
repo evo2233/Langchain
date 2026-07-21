@@ -8,7 +8,7 @@ In the `RAG` folder we will build a system that can use docs in Lark(飞书) and
 
 # env
 python 3.11\
-langchain (1.0.X)\
+langchain (1.3.X)\
 langchain-community\
 langchain-deepseek\
 ollama\

@@ -585,3 +585,306 @@ Too many tools may overwhelm the model (overload context) and increase errors; t
 
 ## 5. Short-term memory
 
+a short-term memory is the thread-level persistence, you need to specify a `checkpointer` when creating an agent.
+
+
+
+**Save in memory**:
+
+```python
+from langchain.agents import create_agent
+from langgraph.checkpoint.memory import InMemorySaver  
+
+
+def get_user_info() -> str:
+    """Look up information about the current user."""
+    return "No user profile on file."
+
+
+agent = create_agent(
+    model="google_genai:gemini-3.5-flash",
+    tools=[get_user_info],
+    checkpointer=InMemorySaver(),
+)
+
+thread_config = {"configurable": {"thread_id": "1"}}
+response = agent.invoke(
+    {"messages": [{"role": "user", "content": "Hi! My name is Bob."}]},
+    thread_config,
+)["messages"][-1].content
+
+print(response)  # "Hi Bob! Nice to see you here. How are you doing?"
+
+response = agent.invoke(
+    {"messages": [{"role": "user", "content": "What's my name?"}]},
+    thread_config,
+)["messages"][-1].content
+
+print(response)  # "You are Bob!"
+```
+
+**Save in database**:
+
+```python
+from langchain.agents import create_agent
+from langgraph.checkpoint.postgres import PostgresSaver  
+
+def get_user_info() -> str:
+    """Look up information about the current user."""
+    return "No user profile on file."
+
+DB_URI = "postgresql://postgres:postgres@localhost:5432/postgres?sslmode=disable"
+with PostgresSaver.from_conn_string(DB_URI) as checkpointer:
+    checkpointer.setup() # auto create tables in PostgreSQL
+    agent = create_agent(
+        "gpt-5.5",
+        tools=[get_user_info],
+        checkpointer=checkpointer,
+    )
+```
+
+
+
+#### Customizing agent memory
+
+By default, agents use `message` filed in `AgentState` to store history, we can extend `AgentState` class to add more fields.
+
+```python
+from langchain.agents import create_agent, AgentState
+from langgraph.checkpoint.memory import InMemorySaver
+
+
+class CustomAgentState(AgentState):
+    user_id: str
+    preferences: dict
+
+agent = create_agent(
+    "gpt-5.5",
+    tools=[get_user_info],
+    state_schema=CustomAgentState,
+    checkpointer=InMemorySaver(),
+)
+
+# Custom state can be passed in invoke
+result = agent.invoke(
+    {
+        "messages": [{"role": "user", "content": "Hello"}],
+        "user_id": "user_123",
+        "preferences": {"theme": "dark"}
+    },
+    {"configurable": {"thread_id": "1"}})
+```
+
+
+
+#### Common patterns
+
+* Trim messages: `@before_model` `RemoveMessage` 
+
+  ```python
+  @before_model
+  def trim_messages(state: AgentState, runtime: Runtime) -> dict[str, Any] | None:
+      """Keep only the last few messages to fit context window."""
+      messages = state["messages"]
+  
+      if len(messages) <= 3:
+          return None  # No changes needed
+  
+      first_msg = messages[0]
+      recent_messages = messages[-3:] if len(messages) % 2 == 0 else messages[-4:]
+      new_messages = [first_msg] + recent_messages
+  
+      return {
+          "messages": [
+              RemoveMessage(id=REMOVE_ALL_MESSAGES),
+              *new_messages
+          ]
+      }
+  ```
+
+* Delete messages: `after_model` `RemoveMessage` 
+
+  ```python
+  @after_model
+  def delete_old_messages(state: AgentState, runtime: Runtime) -> dict | None:
+  	return {"messages": [RemoveMessage(id=m.id) for m in messages[:2]]}  # remove early 2 messages
+  ```
+
+* Summarize messages: [`SummarizationMiddleware`](https://docs.langchain.com/oss/python/langchain/middleware#summarization) 
+
+  ```python
+  agent = create_agent(
+      model="gpt-5.5",
+      tools=[...],
+      middleware=[
+          SummarizationMiddleware(
+              model="gpt-5.4-mini",
+              trigger=("tokens", 4000),
+              keep=("messages", 20)
+          )
+      ],
+      checkpointer=checkpointer,
+  )
+  ```
+
+
+
+
+
+## 6. Streaming
+
+
+
+#### Event stream（v1.3+ & Fine grained）
+
+Usually, use `stream_events()` to make the streaming output. (need `langchain` v1.3+)
+
+```python
+agent = create_agent(
+    model="gpt-5-nano",
+    tools=[get_weather],
+)
+
+stream = agent.stream_events({
+    "messages": [{"role": "user", "content": "What is the weather in SF?"}],
+}, version="v3")
+
+for message in stream.messages:
+    for delta in message.text:
+        print(delta, end="", flush=True)
+```
+
+**Usage** of `stream_events`:
+
+* `stream.messages`: Model message streams, one per LLM call.
+  * `message.text`: Text deltas and final text for a message.
+  * `message.reasoning`: Reasoning deltas for models that expose reasoning content.
+  * `message.tool_calls`: Tool-call argument chunks and finalized tool calls.
+* `stream.tool_calls`: Streams the lifecycle of tool execution after the tool call starts.
+* `stream.values`: Access state snapshots.
+* `stream.output`: Access the final agent state.
+* `stream.subagents`: Subagent model message streams, same as stream.
+  * `subagent.name`: Access the name of subagent.
+  * `subagent.messages`: Similar with `stream.messages`.
+
+
+
+#### Multiple projections 
+
+**concurrent** consumption in async code, use `astream_events` with `asyncio.gather`:
+
+```python
+import asyncio
+
+stream = await agent.astream_events(input, version="v3")
+
+async def consume_messages():
+    async for message in stream.messages:
+        print(await message.text)
+
+async def consume_tool_calls():
+    async for call in stream.tool_calls:
+        print(call.tool_name, call.input)
+
+await asyncio.gather(consume_messages(), consume_tool_calls())
+```
+
+**synchronous** code, use `stream.interleave(...)` instead:
+
+```python
+stream = agent.stream_events(input, version="v3")
+
+for name, item in stream.interleave("messages", "tool_calls", "values"):
+    if name == "messages":
+        print(item.text)
+    elif name == "tool_calls":
+        print(item.tool_name, item.input)
+    elif name == "values":
+        print(item)
+```
+
+
+
+#### Custom updates
+
+Use custom stream transformers when your application needs a projection that is not built in, such as retrieval progress, artifacts, or domain-specific events.
+
+An example for retrieval progress:
+
+```python
+from langgraph.config import get_stream_writer
+from langgraph.stream import ProtocolEvent, StreamChannel, StreamTransformer
+
+# 1. 在你的检索节点中发送进度事件(graph中的节点)
+def retrieval_node(state):
+    writer = get_stream_writer()
+    # 发送自定义进度消息
+    writer({"kind": "progress", "message": "正在检索相关文档..."})
+    
+    # ... 执行实际的检索逻辑 ...
+    
+    writer({"kind": "progress", "message": "检索完成，正在处理结果..."})
+    return state
+
+# 2. 定义处理这些事件的 Transformer
+class RetrievalProgressTransformer(StreamTransformer):
+    def __init__(self, scope: tuple[str, ...] = ()) -> None:
+        super().__init__(scope)
+        # 创建一个名为 "retrieval-progress" 的 channel
+        self.progress_channel = StreamChannel("retrieval-progress")
+
+    def init(self) -> dict:
+        # 将 channel 暴露给流式结果
+        return {"retrieval_progress": self.progress_channel}
+
+    def process(self, event: ProtocolEvent) -> bool:
+        # 捕获我们在节点中写入的自定义事件
+        if event["method"] == "custom" and event["params"]["data"].get("kind") == "progress":
+            self.progress_channel.push(event["params"]["data"]["message"])
+        return True
+
+# 3. 在运行流式处理时使用该 Transformer
+stream = graph.stream_events(
+    input_data, 
+    version="v3", 
+    transformers=[RetrievalProgressTransformer]
+)
+
+# 4. 在消费流时，从 extensions 中读取进度
+for event in stream:
+    if "retrieval_progress" in stream.extensions:
+        # 你可以在这里处理进度更新
+        print(f"进度更新: {stream.extensions['retrieval_progress'].values}")
+```
+
+✅**Code analyse**：
+
+1. What's `StreamTransformer`?
+
+   在 `LangGraph` 的事件流中，每个**事件**都以 `ProtocolEvent` 的类型传递。`StreamTransformer` 会对流中的每个 `ProtocolEvent` 进行处理，可用于监听、过滤、转换事件，并通过 `StreamChannel` 等机制将运行时信息暴露给外部消费者。
+
+   > [!NOTE]
+   >
+   > **节点**（如 Retrieval、Tool、LLM）可通过 `get_stream_writer()` 产生 `custom` 类型的 `ProtocolEvent`，`StreamTransformer` 则负责捕获并处理这些事件。
+   >
+   > 后者可以通过控制`process`返回的bool值，实现过滤事件。
+
+2. What's `StreamChannel`?
+
+   在 `LangGraph` 中，Graph **State** 用于存储 Graph 运行过程中需要参与计算和传递的 State data (a part of runtime data)。对于检索进度、日志等仅用于 UI 展示的数据，如果也写入 Graph State，就会污染 State data。因此，`LangGraph` 提供了基于 **`StreamTransformer + StreamChannel`** 的 **Side Channel** 机制。节点可以通过 `get_stream_writer()` 发出自定义事件，Transformer 对这些事件进行处理，并将需要展示的数据写入 `StreamChannel`。消费者随后可以通过 `stream.extensions` 获取这些数据，用于更新 UI，而无需修改 Graph State。
+
+
+
+#### Stream（v1.1+ & Easy way）
+
+Pass one or more of the following **stream modes** as a list to the `stream` or `astream` methods:
+
+* **updates**: 在 Graph 中的节点执行完成后，流式输出：(该节点的 name, 变更后的 state)。
+*  **messages**: 流式传输大模型（LLM）的输出： (message_chunk, metadata)。
+* **custom**: 在节点或工具内部手动流式传输**自定义数据**，通过 `langgraph.config.get_stream_writer` 写入。
+
+stream modes 由 `chunk["type"]` 判断；内部数据由 `chunk["data"]` 读取，支持多种 modes 列表输入。
+
+**Sub-agent distinction**: Through agent name is then available in metadata via the `lc_agent_name` key when streaming in `"messages"` mode. Don't forget to specify  `subgraphs=True` when creating the stream.
+
+**Disable streaming**: Set `streaming=False` when initializing the model.
