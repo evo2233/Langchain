@@ -888,3 +888,70 @@ stream modes 由 `chunk["type"]` 判断；内部数据由 `chunk["data"]` 读取
 **Sub-agent distinction**: Through agent name is then available in metadata via the `lc_agent_name` key when streaming in `"messages"` mode. Don't forget to specify  `subgraphs=True` when creating the stream.
 
 **Disable streaming**: Set `streaming=False` when initializing the model.
+
+
+
+
+
+## Structured output
+
+
+
+#### `response_format`
+
+have 3 parameters: 
+
+* `ProviderStrategy`: Uses **model-native structured output** capabilities.
+
+  * `strict`: Optional bool parameter to enable strict schema adherence (`null` field is not allowed when it's True).
+
+    ```python
+    ProviderStrategy(FeedbackStrict, strict=True)
+    ```
+
+* `ToolStrategy`: Uses **tool-calling** to enforce structure. Wraps schema as a tool, call it to convert format.
+
+* `type[StructuredResponseT]`: Directly pass your schema. `LangChain` will automatically selects the best strategy above.
+
+```python
+from pydantic import BaseModel, Field
+from langchain.agents import create_agent
+
+class ContactInfo(BaseModel):
+    """Contact information for a person."""
+    name: str = Field(description="The name of the person")
+    email: str = Field(description="The email address of the person")
+    phone: str = Field(description="The phone number of the person")
+
+agent = create_agent(
+    model="gpt-5.5",
+    response_format=ContactInfo  # Auto-selects ProviderStrategy
+)
+```
+
+
+
+#### `ToolStrategy` parameters
+
+**schema** (required): The schema defining the structured output format. Supports:
+
+- **Pydantic models**: `BaseModel` subclasses with field validation. Returns validated Pydantic instance.
+- **Dataclasses**: Python dataclasses with type annotations. Returns dict.
+- **TypedDict**: Typed dictionary classes. Returns dict.
+- **JSON Schema**: Dictionary with JSON schema specification. Returns dictionary.
+- **Union types**: *Multiple schema options*. The model will choose the most appropriate schema based on the context.
+
+> [!CAUTION]
+>
+> **Union types** is not supported in schema of `ProviderStrategy`.
+
+**tool_message_content**: Custom content for the tool message returned when structured output is generated. If not provided, defaults to a message showing the structured response data.
+
+**handle_errors**: Error handling strategy for structured output validation failures. Defaults to `True`.
+
+- **`True`**: Catch all errors with default error template
+- **`str`**: Catch all errors with this custom message
+- **`type[Exception]`**: Only catch this exception type with default message
+- **`tuple[type[Exception], ...]`**: Only catch these exception types with default message
+- **`Callable[[Exception], str]`**: Custom function that returns error message
+- **`False`**: No retry, let exceptions propagate
